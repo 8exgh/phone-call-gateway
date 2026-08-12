@@ -13,7 +13,12 @@ export function buildDeps(config: AppConfig, opts: { framePacingMs?: number } = 
   if (config.mode === 'live') {
     // loadConfig guarantees these are present in live mode.
     return {
-      twilioApi: new LiveTwilioApi(config.twilioAccountSid!, config.twilioAuthToken!),
+      twilioApi: new LiveTwilioApi({
+        accountSid: config.twilioAccountSid!,
+        authToken: config.twilioAuthToken,
+        apiKeySid: config.twilioApiKeySid,
+        apiKeySecret: config.twilioApiKeySecret,
+      }),
       synthesizer: new OpenAiSpeechSynthesizer(config.openAiApiKey!, config.ttsModel, config.ttsVoice),
       transcriberFactory: new OpenAiTranscriberFactory(config.openAiApiKey!, config.transcribeModel),
     };

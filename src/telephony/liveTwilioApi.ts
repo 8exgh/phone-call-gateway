@@ -8,11 +8,23 @@ import type {
   TwilioApi,
 } from './twilioApi';
 
+export interface TwilioCredentials {
+  accountSid: string;
+  /** Classic auth. */
+  authToken?: string;
+  /** API-key auth (preferred: revocable, doesn't expose the account token). */
+  apiKeySid?: string;
+  apiKeySecret?: string;
+}
+
 export class LiveTwilioApi implements TwilioApi {
   private readonly client: twilio.Twilio;
 
-  constructor(accountSid: string, authToken: string) {
-    this.client = twilio(accountSid, authToken);
+  constructor(creds: TwilioCredentials) {
+    this.client =
+      creds.apiKeySid && creds.apiKeySecret
+        ? twilio(creds.apiKeySid, creds.apiKeySecret, { accountSid: creds.accountSid })
+        : twilio(creds.accountSid, creds.authToken);
   }
 
   async searchNumbers(areaCode: string): Promise<AvailableNumber[]> {

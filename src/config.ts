@@ -6,6 +6,8 @@ const envSchema = z.object({
   PUBLIC_WSS_URL: z.string().url().optional().or(z.literal('').transform(() => undefined)),
   TWILIO_ACCOUNT_SID: z.string().optional(),
   TWILIO_AUTH_TOKEN: z.string().optional(),
+  TWILIO_API_KEY_SID: z.string().optional(),
+  TWILIO_API_KEY_SECRET: z.string().optional(),
   TWILIO_FROM_NUMBER: z.string().optional(),
   OPENAI_API_KEY: z.string().optional(),
   TTS_MODEL: z.string().default('gpt-4o-mini-tts'),
@@ -21,6 +23,9 @@ export interface AppConfig {
   publicWssUrl?: string;
   twilioAccountSid?: string;
   twilioAuthToken?: string;
+  /** API-key auth (preferred over the account auth token; revocable). */
+  twilioApiKeySid?: string;
+  twilioApiKeySecret?: string;
   twilioFromNumber?: string;
   openAiApiKey?: string;
   ttsModel: string;
@@ -37,16 +42,20 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const parsed = envSchema.parse(env);
 
   if (parsed.MODE === 'live') {
-    const missing = (
+    const missing: string[] = (
       [
         ['TWILIO_ACCOUNT_SID', parsed.TWILIO_ACCOUNT_SID],
-        ['TWILIO_AUTH_TOKEN', parsed.TWILIO_AUTH_TOKEN],
         ['OPENAI_API_KEY', parsed.OPENAI_API_KEY],
         ['PUBLIC_WSS_URL', parsed.PUBLIC_WSS_URL],
       ] as const
     )
       .filter(([, value]) => !value)
       .map(([name]) => name);
+    const hasAuthToken = Boolean(parsed.TWILIO_AUTH_TOKEN);
+    const hasApiKey = Boolean(parsed.TWILIO_API_KEY_SID && parsed.TWILIO_API_KEY_SECRET);
+    if (!hasAuthToken && !hasApiKey) {
+      missing.push('TWILIO_AUTH_TOKEN (or TWILIO_API_KEY_SID + TWILIO_API_KEY_SECRET)');
+    }
     if (missing.length > 0) {
       throw new Error(`MODE=live requires: ${missing.join(', ')}`);
     }
@@ -58,6 +67,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     publicWssUrl: parsed.PUBLIC_WSS_URL,
     twilioAccountSid: parsed.TWILIO_ACCOUNT_SID,
     twilioAuthToken: parsed.TWILIO_AUTH_TOKEN,
+    twilioApiKeySid: parsed.TWILIO_API_KEY_SID,
+    twilioApiKeySecret: parsed.TWILIO_API_KEY_SECRET,
     twilioFromNumber: parsed.TWILIO_FROM_NUMBER,
     openAiApiKey: parsed.OPENAI_API_KEY,
     ttsModel: parsed.TTS_MODEL,
