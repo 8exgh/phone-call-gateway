@@ -5,7 +5,9 @@ import { FakeTwilioApi } from '../../src/fakes/fakeTwilioApi';
 import { FakeSpeechSynthesizer } from '../../src/fakes/fakeSynthesizer';
 import { FakeTranscriberFactory } from '../../src/fakes/fakeTranscriber';
 import { defaultCallerScript, type CallerScript } from '../../src/fakes/callerScript';
+import { FakeChatClient, demoChatScript } from '../../src/fakes/fakeChatClient';
 import type { SpeechSynthesizer } from '../../src/speech/synthesizer';
+import type { ChatClient } from '../../src/orchestrator/chatClient';
 import {
   parseServerMessage,
   type ClientMessage,
@@ -20,7 +22,11 @@ export interface Gateway {
 }
 
 export async function startGateway(
-  opts: { script?: CallerScript; synthesizer?: SpeechSynthesizer } = {},
+  opts: {
+    script?: CallerScript;
+    synthesizer?: SpeechSynthesizer;
+    chatClientFactory?: () => ChatClient;
+  } = {},
 ): Promise<Gateway> {
   const script = opts.script ?? defaultCallerScript;
   const twilioApi = new FakeTwilioApi({ script, framePacingMs: 0 });
@@ -29,6 +35,7 @@ export async function startGateway(
       twilioApi,
       synthesizer: opts.synthesizer ?? new FakeSpeechSynthesizer(),
       transcriberFactory: new FakeTranscriberFactory(script),
+      chatClientFactory: opts.chatClientFactory ?? (() => new FakeChatClient(demoChatScript)),
     },
     { ttsVoice: 'alloy' },
   );

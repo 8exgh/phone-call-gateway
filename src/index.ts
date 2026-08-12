@@ -5,9 +5,11 @@ import { FakeTwilioApi } from './fakes/fakeTwilioApi';
 import { FakeSpeechSynthesizer } from './fakes/fakeSynthesizer';
 import { FakeTranscriberFactory } from './fakes/fakeTranscriber';
 import { defaultCallerScript } from './fakes/callerScript';
+import { FakeChatClient, demoChatScript } from './fakes/fakeChatClient';
 import { LiveTwilioApi } from './telephony/liveTwilioApi';
 import { OpenAiSpeechSynthesizer } from './speech/openAiSynthesizer';
 import { OpenAiTranscriberFactory } from './speech/openAiTranscriber';
+import { OpenAiChatClient } from './orchestrator/openAiChatClient';
 
 export function buildDeps(config: AppConfig, opts: { framePacingMs?: number } = {}): ServerDeps {
   if (config.mode === 'live') {
@@ -21,6 +23,7 @@ export function buildDeps(config: AppConfig, opts: { framePacingMs?: number } = 
       }),
       synthesizer: new OpenAiSpeechSynthesizer(config.openAiApiKey!, config.ttsModel, config.ttsVoice),
       transcriberFactory: new OpenAiTranscriberFactory(config.openAiApiKey!, config.transcribeModel),
+      chatClientFactory: () => new OpenAiChatClient(config.openAiApiKey!, config.chatModel),
     };
   }
   return {
@@ -31,6 +34,10 @@ export function buildDeps(config: AppConfig, opts: { framePacingMs?: number } = 
     }),
     synthesizer: new FakeSpeechSynthesizer(),
     transcriberFactory: new FakeTranscriberFactory(defaultCallerScript),
+    chatClientFactory: () =>
+      config.openAiApiKey
+        ? new OpenAiChatClient(config.openAiApiKey, config.chatModel)
+        : new FakeChatClient(demoChatScript),
   };
 }
 

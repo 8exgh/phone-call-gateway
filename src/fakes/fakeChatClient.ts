@@ -6,6 +6,13 @@ export interface ScriptedReply {
   reply: string;
 }
 
+/** Replies that pair with defaultCallerScript for mock-mode demos. */
+export const demoChatScript: ScriptedReply[] = [
+  { reply: 'This is the phone-call-gateway demo agent, just testing the audio pipeline.' },
+  { reply: 'I hear you loud and clear — no worries, this is only a local demo. Keeping it short.' },
+  { reply: 'Thanks for listening. Have a great day! HANGUP' },
+];
+
 /** Deterministic LLM for tests and mock-mode demos. */
 export class FakeChatClient implements ChatClient {
   readonly receivedUserContents: string[] = [];

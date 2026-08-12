@@ -6,7 +6,7 @@ import { buildServer } from '../server';
 import { buildDeps } from '../index';
 import { Orchestrator } from '../orchestrator/orchestrator';
 import { OpenAiChatClient } from '../orchestrator/openAiChatClient';
-import { FakeChatClient } from '../fakes/fakeChatClient';
+import { FakeChatClient, demoChatScript } from '../fakes/fakeChatClient';
 import type { ChatClient, ChatMessage } from '../orchestrator/chatClient';
 
 /**
@@ -40,12 +40,6 @@ class LoggingChatClient implements ChatClient {
     return reply;
   }
 }
-
-const demoScript = [
-  { reply: 'This is the phone-call-gateway demo agent, just testing the audio pipeline.' },
-  { reply: 'I hear you loud and clear — no worries, this is only a local demo. Keeping it short.' },
-  { reply: 'Thanks for listening. Have a great day! HANGUP' },
-];
 
 async function main(): Promise<void> {
   const config = loadConfig();
@@ -97,7 +91,7 @@ async function main(): Promise<void> {
 
   const innerChat: ChatClient = config.openAiApiKey
     ? new OpenAiChatClient(config.openAiApiKey, config.chatModel)
-    : new FakeChatClient(demoScript);
+    : new FakeChatClient(demoChatScript);
   if (!config.openAiApiKey) {
     console.log('· no OPENAI_API_KEY: using the scripted fake LLM');
   }

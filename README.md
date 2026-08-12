@@ -59,6 +59,18 @@ Caller [volume: whisper, pace: normal]: okay... fine. that sounds reasonable.
 - REST — calls: `POST /calls {to, from?}` → `{callId, controlUrl}` (`from` defaults to the last
   session purchase, then `TWILIO_FROM_NUMBER`, then any owned number), `GET/DELETE /calls/:id`,
   `GET /health`.
+- REST — one-shot orchestrations (the agent-friendly surface): `POST /orchestrations
+  {to, goal, openingLine?, voice?, from?}` places the call **and** runs the whole conversation
+  server-side with the configured LLM; poll `GET /orchestrations/:id` for `status`
+  (`running|ended|failed`), a live prosody-annotated transcript, and the final turn list. One
+  HTTP call = one complete phone conversation — ideal for chat agents (OpenClaw etc.) that
+  can't hold a low-latency WebSocket loop themselves:
+
+  ```bash
+  curl -X POST $GW/orchestrations -H 'content-type: application/json' \
+    -d '{"to":"+15551234567","goal":"Book a table for 2 at 7pm Friday under Ana"}'
+  # → {"orchestrationId":"...","statusUrl":"/orchestrations/..."}
+  ```
 - Twilio reaches `/twilio/media/:callId` via bidirectional Media Streams
   (`<Connect><Stream>`); the orchestrator connects to `/control/:callId`.
 - **Media clock**: all prosody timestamps are Twilio frame count × 20ms — never wall
