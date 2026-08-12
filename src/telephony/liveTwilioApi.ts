@@ -29,6 +29,15 @@ export class LiveTwilioApi implements TwilioApi {
     return { sid: purchased.sid, phoneNumber: purchased.phoneNumber };
   }
 
+  async listOwnedNumbers(): Promise<PurchasedNumber[]> {
+    const numbers = await this.client.incomingPhoneNumbers.list({ limit: 200 });
+    return numbers.map((n) => ({ sid: n.sid, phoneNumber: n.phoneNumber }));
+  }
+
+  async releaseNumber(sid: string): Promise<void> {
+    await this.client.incomingPhoneNumbers(sid).remove();
+  }
+
   async createCall(params: CreateCallParams): Promise<CreatedCall> {
     const call = await this.client.calls.create({
       to: params.to,

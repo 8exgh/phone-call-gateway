@@ -43,6 +43,16 @@ export class FakeTwilioApi implements TwilioApi {
     return purchased;
   }
 
+  async listOwnedNumbers(): Promise<PurchasedNumber[]> {
+    return [...this.purchasedNumbers];
+  }
+
+  async releaseNumber(sid: string): Promise<void> {
+    const index = this.purchasedNumbers.findIndex((p) => p.sid === sid);
+    if (index === -1) throw new Error(`no owned number with sid ${sid}`);
+    this.purchasedNumbers.splice(index, 1);
+  }
+
   async createCall(params: CreateCallParams): Promise<CreatedCall> {
     if (!this.purchasedNumbers.some((p) => p.phoneNumber === params.from)) {
       throw new Error(`from number ${params.from} is not owned by this account`);

@@ -52,8 +52,13 @@ Caller [volume: whisper, pace: normal]: okay... fine. that sounds reasonable.
                  └───────────────────────────────────────────────────────────────────┘
 ```
 
-- REST: `POST /numbers {areaCode}` (search + purchase), `POST /calls {to, from?}` →
-  `{callId, controlUrl}`, `GET/DELETE /calls/:id`, `GET /health`.
+- REST — numbers: `GET /numbers/available?areaCode=415` (preview candidates),
+  `POST /numbers` with `{areaCode}` (buy first match) or `{phoneNumber}` (buy that exact one),
+  `GET /numbers` (owned, straight from Twilio so it survives restarts),
+  `DELETE /numbers/:sid` (release — stops monthly billing).
+- REST — calls: `POST /calls {to, from?}` → `{callId, controlUrl}` (`from` defaults to the last
+  session purchase, then `TWILIO_FROM_NUMBER`, then any owned number), `GET/DELETE /calls/:id`,
+  `GET /health`.
 - Twilio reaches `/twilio/media/:callId` via bidirectional Media Streams
   (`<Connect><Stream>`); the orchestrator connects to `/control/:callId`.
 - **Media clock**: all prosody timestamps are Twilio frame count × 20ms — never wall
