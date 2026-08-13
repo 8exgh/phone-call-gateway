@@ -28,12 +28,20 @@ export class LiveTwilioApi implements TwilioApi {
   }
 
   async searchNumbers(areaCode: string): Promise<AvailableNumber[]> {
-    const numbers = await this.client.availablePhoneNumbers('US').local.list({
-      areaCode: Number(areaCode),
-      voiceEnabled: true,
-      limit: 5,
-    });
-    return numbers.map((n) => ({ phoneNumber: n.phoneNumber, locality: n.locality }));
+    // Area codes are unique across the North American Numbering Plan, but
+    // Twilio scopes searches by country — so try US first, then Canada
+    // (e.g. 587 is Alberta).
+    for (const country of ['US', 'CA'] as const) {
+      const numbers = await this.client.availablePhoneNumbers(country).local.list({
+        areaCode: Number(areaCode),
+        voiceEnabled: true,
+        limit: 5,
+      });
+      if (numbers.length > 0) {
+        return numbers.map((n) => ({ phoneNumber: n.phoneNumber, locality: n.locality }));
+      }
+    }
+    return [];
   }
 
   async purchaseNumber(phoneNumber: string): Promise<PurchasedNumber> {
