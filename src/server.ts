@@ -115,7 +115,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
       return purchased;
     } catch (error) {
       return reply
-        .code(502)
+        .code(424)
         .send({ error: `purchase of ${phoneNumber} failed: ${(error as Error).message}` });
     }
   });
@@ -189,7 +189,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     }
     const started = await startCall(parsed.data.to, from);
     if (!started.ok) {
-      return reply.code(502).send({ error: started.error, callId: started.callId });
+      return reply.code(424).send({ error: started.error, callId: started.callId });
     }
     return { callId: started.callId, to: parsed.data.to, from, controlUrl: `/control/${started.callId}` };
   });
@@ -212,7 +212,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     }
     const started = await startCall(parsed.data.to, from);
     if (!started.ok) {
-      return reply.code(502).send({ error: started.error, callId: started.callId });
+      return reply.code(424).send({ error: started.error, callId: started.callId });
     }
 
     const record: OrchestrationRecord = {

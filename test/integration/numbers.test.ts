@@ -86,7 +86,7 @@ describe('number provisioning API', () => {
       to: '+15551234567',
       from: String(bought.json.phoneNumber),
     });
-    expect(call.status).toBe(502);
+    expect(call.status).toBe(424);
     expect(String(call.json.error)).toContain('not owned');
   });
 });
