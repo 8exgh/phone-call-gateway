@@ -60,6 +60,8 @@ interface OrchestrationRecord {
   turns: ConversationTurn[];
   /** Caller transcript lines observed so far, with prosody, for live polling. */
   liveTranscript: string[];
+  /** In-call error events (e.g. stt_failed), so failures are visible when polling. */
+  errors: string[];
 }
 
 export async function buildServer(deps: ServerDeps, config: ServerConfig): Promise<FastifyInstance> {
@@ -223,6 +225,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
       status: 'running',
       turns: [],
       liveTranscript: [],
+      errors: [],
     };
     orchestrations.set(record.id, record);
 
@@ -239,6 +242,8 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
           record.liveTranscript.push(
             `[${event.volume.class}, ${event.pace.class}${stutter}] ${event.text}`,
           );
+        } else if (event.type === 'error') {
+          record.errors.push(`${event.code}: ${event.message}`);
         }
       },
     });

@@ -31,23 +31,27 @@ class OpenAiTranscriberSession implements TranscriberSession {
 
   private connect(): void {
     const socket = new WebSocket(REALTIME_URL, {
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        'OpenAI-Beta': 'realtime=v1',
-      },
+      headers: { Authorization: `Bearer ${this.apiKey}` },
     });
     this.ws = socket;
     this.ready = false;
 
     socket.on('open', () => {
       if (this.ws !== socket) return;
+      // GA realtime API shape (the beta transcription_session.update was
+      // retired with error code beta_api_shape_disabled).
       socket.send(
         JSON.stringify({
-          type: 'transcription_session.update',
+          type: 'session.update',
           session: {
-            input_audio_format: 'pcm16',
-            input_audio_transcription: { model: this.model },
-            turn_detection: { type: 'server_vad', silence_duration_ms: 300 },
+            type: 'transcription',
+            audio: {
+              input: {
+                format: { type: 'audio/pcm', rate: 24000 },
+                transcription: { model: this.model },
+                turn_detection: { type: 'server_vad', silence_duration_ms: 300 },
+              },
+            },
           },
         }),
       );
