@@ -42,6 +42,17 @@ const callsBodySchema = z.object({
   from: z.string().optional(),
 });
 
+const smsBodySchema = z.object({
+  to: z.string().regex(/^\+\d{8,15}$/, 'to must be E.164, e.g. +14155550100'),
+  body: z.string().min(1).max(1600),
+  from: z.string().optional(),
+});
+
+const smsQuerySchema = z.object({
+  days: z.coerce.number().int().min(1).max(90).default(30),
+  limit: z.coerce.number().int().min(1).max(500).default(100),
+});
+
 const orchestrationBodySchema = z.object({
   to: z.string().min(3),
   from: z.string().optional(),
@@ -222,6 +233,43 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
       return reply.code(424).send({ error: started.error, callId: started.callId });
     }
     return { callId: started.callId, to: parsed.data.to, from, controlUrl: `/control/${started.callId}` };
+  });
+
+  app.post('/sms', async (req, reply) => {
+    const parsed = smsBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid body' });
+    }
+    const from = await resolveFrom(parsed.data.from);
+    if (!from) {
+      return reply
+        .code(400)
+        .send({ error: 'no from number: register one via POST /numbers or set TWILIO_FROM_NUMBER' });
+    }
+    try {
+      const sent = await deps.twilioApi.sendSms({ to: parsed.data.to, from, body: parsed.data.body });
+      return { sid: sent.sid, status: sent.status, to: parsed.data.to, from, body: parsed.data.body };
+    } catch (error) {
+      return reply.code(424).send({ error: `sms send failed: ${(error as Error).message}` });
+    }
+  });
+
+  // Message history, both directions (default: last 30 days). Inbound SMS
+  // appear here with no webhook needed, so this is also how you "receive".
+  app.get('/sms', async (req, reply) => {
+    const parsed = smsQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid query' });
+    }
+    try {
+      const messages = await deps.twilioApi.listSms({
+        sinceDays: parsed.data.days,
+        limit: parsed.data.limit,
+      });
+      return { days: parsed.data.days, count: messages.length, messages };
+    } catch (error) {
+      return reply.code(424).send({ error: `sms list failed: ${(error as Error).message}` });
+    }
   });
 
   const orchestrations = new Map<string, OrchestrationRecord>();

@@ -24,6 +24,28 @@ export interface CreatedCall {
   providerCallSid: string;
 }
 
+export interface SendSmsParams {
+  to: string;
+  from: string;
+  body: string;
+}
+
+export interface SentSms {
+  sid: string;
+  status: string;
+}
+
+export interface SmsMessage {
+  sid: string;
+  direction: 'inbound' | 'outbound';
+  from: string;
+  to: string;
+  body: string;
+  status: string;
+  /** ISO timestamp of when the message was sent or received. */
+  sentAt: string;
+}
+
 export interface TwilioApi {
   searchNumbers(areaCode: string): Promise<AvailableNumber[]>;
   purchaseNumber(phoneNumber: string): Promise<PurchasedNumber>;
@@ -33,4 +55,11 @@ export interface TwilioApi {
   releaseNumber(sid: string): Promise<void>;
   createCall(params: CreateCallParams): Promise<CreatedCall>;
   hangupCall(providerCallSid: string): Promise<void>;
+  sendSms(params: SendSmsParams): Promise<SentSms>;
+  /**
+   * Messages (both directions) from the last sinceDays days, newest first.
+   * Inbound messages appear here even with no SMS webhook configured, so
+   * "receiving" works by reading this list.
+   */
+  listSms(opts: { sinceDays: number; limit?: number }): Promise<SmsMessage[]>;
 }

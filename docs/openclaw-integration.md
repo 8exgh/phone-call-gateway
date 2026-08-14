@@ -125,6 +125,47 @@ curl -s -X DELETE "$PHONE_GATEWAY_URL/numbers/<sid>"          # release
 
 Area codes are searched US-first with Canadian fallback (587 is Alberta).
 
+## SMS
+
+The gateway's number (+15877417105) is SMS+MMS capable.
+
+Send:
+
+```bash
+curl -s -X POST "$PHONE_GATEWAY_URL/sms" -H 'content-type: application/json' \
+  -d '{"to": "+15551234567", "body": "Your table for 2 at 7pm Friday is booked."}'
+# → { "sid": "SM…", "status": "queued", "to": "…", "from": "+15877417105", "body": "…" }
+```
+
+`from` is optional and defaults to the gateway's number. Errors: `400` invalid
+body or no from-number, `424` provider rejected the send.
+
+Read history / receive (last 30 days by default, newest first; inbound
+messages appear here with no webhook needed — poll this to "receive"):
+
+```bash
+curl -s "$PHONE_GATEWAY_URL/sms"            # last 30 days, up to 100 messages
+curl -s "$PHONE_GATEWAY_URL/sms?days=7&limit=20"
+```
+
+```json
+{
+  "days": 30,
+  "count": 2,
+  "messages": [
+    { "sid": "SM…", "direction": "inbound",  "from": "+15878998081",
+      "to": "+15877417105", "body": "a reply!", "status": "received",
+      "sentAt": "2026-08-14T21:04:11.000Z" },
+    { "sid": "SM…", "direction": "outbound", "from": "+15877417105",
+      "to": "+15878998081", "body": "hello", "status": "delivered",
+      "sentAt": "2026-08-14T21:03:02.000Z" }
+  ]
+}
+```
+
+`days` accepts 1–90, `limit` 1–500. There is no push notification for inbound
+SMS yet — poll `GET /sms` when expecting a reply.
+
 ## Receiving calls (pickup)
 
 **Not supported yet — the gateway is outbound-only (v1).** Nothing answers if

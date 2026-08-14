@@ -5,6 +5,9 @@ import type {
   CreateCallParams,
   CreatedCall,
   PurchasedNumber,
+  SendSmsParams,
+  SentSms,
+  SmsMessage,
   TwilioApi,
 } from './twilioApi';
 
@@ -69,5 +72,30 @@ export class LiveTwilioApi implements TwilioApi {
 
   async hangupCall(providerCallSid: string): Promise<void> {
     await this.client.calls(providerCallSid).update({ status: 'completed' });
+  }
+
+  async sendSms(params: SendSmsParams): Promise<SentSms> {
+    const message = await this.client.messages.create({
+      to: params.to,
+      from: params.from,
+      body: params.body,
+    });
+    return { sid: message.sid, status: message.status };
+  }
+
+  async listSms(opts: { sinceDays: number; limit?: number }): Promise<SmsMessage[]> {
+    const messages = await this.client.messages.list({
+      dateSentAfter: new Date(Date.now() - opts.sinceDays * 24 * 60 * 60 * 1000),
+      limit: opts.limit ?? 100,
+    });
+    return messages.map((m) => ({
+      sid: m.sid,
+      direction: m.direction === 'inbound' ? 'inbound' : 'outbound',
+      from: m.from,
+      to: m.to,
+      body: m.body,
+      status: m.status,
+      sentAt: (m.dateSent ?? m.dateCreated).toISOString(),
+    }));
   }
 }
