@@ -72,6 +72,39 @@ describe('LLM-orchestrated conversation (full E2E)', () => {
     expect(events.some((e) => e.type === 'say.aborted')).toBe(false);
   });
 
+  it('ignores quiet line echo of its own speech: no false barge-in, no ghost transcript', async () => {
+    gw = await startGateway({
+      script: [
+        { pauseMs: 200 },
+        // Once the opening line is mid-playback, the line "echoes" it back
+        // quietly, as real telephony does.
+        { waitForAgentAudioMs: 400 },
+        { speak: { text: 'this is just line echo', durationMs: 1000, amplitudeDb: -30 } },
+        { pauseMs: 3600 }, // let the opening finish playing
+        { hangup: true },
+      ],
+    });
+
+    const events: ServerMessage[] = [];
+    const orchestrator = new Orchestrator({
+      controlUrl: await createCall(),
+      chatClient: new FakeChatClient([]),
+      systemPrompt: 'You are a test agent.',
+      openingLine: 'This is a long opening line that keeps playing for quite a while now.',
+      onEvent: (e) => events.push(e),
+    });
+
+    const result = await orchestrator.run();
+
+    expect(result.finalState).toBe('ended');
+    // The echo neither read as caller speech nor interrupted playback.
+    expect(events.some((e) => e.type === 'speech.started')).toBe(false);
+    expect(events.some((e) => e.type === 'say.aborted')).toBe(false);
+    expect(events.filter((e) => e.type === 'say.completed')).toHaveLength(1);
+    expect(gw.twilioApi.mediaClients[0]!.clearsReceived).toBe(0);
+    expect(result.turns.map((t) => t.role)).toEqual(['agent']);
+  });
+
   it('barges in when the caller talks over the agent', async () => {
     gw = await startGateway({
       script: [

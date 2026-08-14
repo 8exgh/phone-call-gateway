@@ -20,9 +20,11 @@ const SILENCE_FRAME = new Uint8Array(MULAW_FRAME_BYTES).fill(MULAW_SILENCE);
  * mu-law media events (with continuous silence frames between utterances, as a
  * real call would), captures outbound audio, acks marks, and honors clear.
  *
- * Playback is simulated as instant: marks are acked as soon as they arrive.
- * The media clock is frame count, so tests run faster than realtime when
- * framePacingMs is 0.
+ * Playback advances on the media clock like real Twilio: one buffered outbound
+ * frame plays per inbound frame tick, and a mark is acked only once every
+ * frame received before it has played (clear empties the buffer and flushes
+ * pending marks immediately, as documented). The media clock is frame count,
+ * so tests still run faster than realtime when framePacingMs is 0.
  */
 export class FakeTwilioMediaClient {
   /** Outbound (gateway -> caller) mu-law frames, decoded from base64. */
@@ -35,6 +37,9 @@ export class FakeTwilioMediaClient {
   private readonly framePacingMs: number;
   private pendingAudio: Int16Array | null = null;
   private pendingOffset = 0;
+  private framesReceived = 0;
+  private framesPlayed = 0;
+  private pendingMarkAcks: { name: string; threshold: number }[] = [];
   /** Marks acked that waitForSayCompleted steps have already consumed. */
   private waitsConsumed = 0;
   private stopped = false;
@@ -102,20 +107,32 @@ export class FakeTwilioMediaClient {
       case 'media':
         if (typeof msg.media?.payload === 'string') {
           this.capturedOutbound.push(fromBase64(msg.media.payload));
+          this.framesReceived++;
         }
         break;
       case 'mark':
-        // Instant playback: all audio before the mark has "played".
+        // Ack only once everything received before the mark has played.
         if (typeof msg.mark?.name === 'string') {
-          this.marksAcked++;
-          this.send({ event: 'mark', streamSid: this.opts.streamSid, mark: { name: msg.mark.name } });
+          this.pendingMarkAcks.push({ name: msg.mark.name, threshold: this.framesReceived });
+          this.ackPlayedMarks();
         }
         break;
       case 'clear':
         this.clearsReceived++;
+        // The buffer is emptied and any pending marks come straight back.
+        this.framesPlayed = this.framesReceived;
+        this.ackPlayedMarks();
         break;
       default:
         break;
+    }
+  }
+
+  private ackPlayedMarks(): void {
+    while (this.pendingMarkAcks.length > 0 && this.pendingMarkAcks[0]!.threshold <= this.framesPlayed) {
+      const { name } = this.pendingMarkAcks.shift()!;
+      this.marksAcked++;
+      this.send({ event: 'mark', streamSid: this.opts.streamSid, mark: { name } });
     }
   }
 
@@ -134,6 +151,11 @@ export class FakeTwilioMediaClient {
         streamSid: this.opts.streamSid,
         media: { payload: toBase64(frame ?? SILENCE_FRAME) },
       });
+      // One inbound frame tick = 20ms of call time = one buffered frame played.
+      if (this.framesPlayed < this.framesReceived) {
+        this.framesPlayed++;
+        this.ackPlayedMarks();
+      }
       await this.pace();
     }
   }

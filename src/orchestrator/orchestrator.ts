@@ -38,6 +38,28 @@ export interface CallResult {
   turns: ConversationTurn[];
 }
 
+function normalizeWords(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s']/gu, ' ')
+    .split(/\s+/)
+    .filter((w) => w.length > 0);
+}
+
+/**
+ * True when a caller transcript is (mostly) a copy of something the agent just
+ * said: residual line echo that slipped past the audio-level gate. Feeding it
+ * to the LLM would make the agent answer itself.
+ */
+export function isEchoOfAgent(callerText: string, recentAgentTexts: string[]): boolean {
+  const callerWords = normalizeWords(callerText);
+  if (callerWords.length === 0) return true;
+  const agentWords = new Set(recentAgentTexts.flatMap(normalizeWords));
+  if (agentWords.size === 0) return false;
+  const contained = callerWords.filter((w) => agentWords.has(w)).length;
+  return contained / callerWords.length >= 0.8 && callerWords.length >= 3;
+}
+
 export function formatProsody(t: TranscriptMessage): string {
   const parts = [`volume: ${t.volume.class}`, `pace: ${t.pace.class}`];
   if (t.stutter.detected) parts.push('stuttering');
@@ -127,13 +149,19 @@ export class Orchestrator {
         if (msg.state === 'ended') this.finish('ended', msg.reason);
         if (msg.state === 'failed') this.finish('failed', msg.reason);
         break;
-      case 'transcript':
+      case 'transcript': {
+        const recentAgentTexts = this.turns
+          .filter((t) => t.role === 'agent')
+          .slice(-2)
+          .map((t) => t.text);
+        if (isEchoOfAgent(msg.text, recentAgentTexts)) break;
         this.disarmSilenceTimer();
         this.lastTranscript = msg;
         this.turns.push({ role: 'caller', text: msg.text, annotation: formatProsody(msg) });
         this.pendingUserTexts.push(`${formatProsody(msg)} "${msg.text}"`);
         void this.respond();
         break;
+      }
       case 'speech.started':
         this.disarmSilenceTimer();
         // Barge-in: the caller is talking over us; stop our audio.
@@ -200,7 +228,10 @@ export class Orchestrator {
     }
   }
 
-  private say(text: string): string {
+  private say(rawText: string): string {
+    // LLMs sometimes wrap replies in quotation marks despite instructions;
+    // spoken text must not include them.
+    const text = rawText.replace(/^["'“”‘’\s]+|["'“”‘’\s]+$/g, '') || rawText;
     const id = `say-${++this.sayCounter}`;
     this.saysInFlight.add(id);
     this.turns.push({ role: 'agent', text });

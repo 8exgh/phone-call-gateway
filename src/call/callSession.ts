@@ -19,6 +19,26 @@ export interface CallSessionDeps {
 const EVENT_BUFFER_LIMIT = 1000;
 
 /**
+ * Geigel-style double-talk detection: while our audio is playing, inbound
+ * sound only counts as caller speech if its peak exceeds this fraction of the
+ * loudest recently-played outbound audio. Below that it is treated as line
+ * echo of our own voice, which would otherwise trigger false barge-ins that
+ * chop our speech mid-word.
+ */
+const ECHO_SUPPRESSION_RATIO = 0.5;
+/** How far back (in 20ms frames) played-audio peaks are considered echo sources. */
+const ECHO_LOOKBACK_FRAMES = 40;
+/** How far ahead of the playhead estimate to look, absorbing timing jitter. */
+const ECHO_LOOKAHEAD_FRAMES = 10;
+/**
+ * Frames of audio to accumulate before releasing an utterance's first frame,
+ * so TTS generation jitter cannot make playback run dry at utterance start.
+ */
+const PREBUFFER_FRAMES = 20; // 400ms
+
+const SILENT_8K_FRAME = new Int16Array(MULAW_FRAME_BYTES);
+
+/**
  * State machine for one call, tying together the Twilio media socket, the
  * control socket, TTS, STT, and prosody analysis.
  *
@@ -48,6 +68,15 @@ export class CallSession {
   private processingSayQueue = false;
   /** markName -> sayId, awaiting Twilio's playback acknowledgement. */
   private pendingMarks = new Map<string, string>();
+
+  /**
+   * Peak amplitude of each outbound frame not yet played, drained one entry
+   * per inbound frame (both sides run at one frame per 20ms of call time, so
+   * the drain position tracks Twilio's playhead).
+   */
+  private playbackPeaks: number[] = [];
+  /** Peaks of recently-played frames: the echo sources to compare against. */
+  private recentPlayedPeaks: number[] = [];
 
   constructor(
     readonly callId: string,
@@ -176,10 +205,35 @@ export class CallSession {
     }
   }
 
+  /** True while the inbound frame is judged to be echo of our own playback. */
+  private isEchoFrame(inbound: Int16Array): boolean {
+    if (this.playbackPeaks.length === 0) {
+      this.recentPlayedPeaks = [];
+      return false;
+    }
+    this.recentPlayedPeaks.push(this.playbackPeaks.shift()!);
+    if (this.recentPlayedPeaks.length > ECHO_LOOKBACK_FRAMES) this.recentPlayedPeaks.shift();
+    let ref = 0;
+    for (const p of this.recentPlayedPeaks) ref = Math.max(ref, p);
+    const lookahead = Math.min(ECHO_LOOKAHEAD_FRAMES, this.playbackPeaks.length);
+    for (let i = 0; i < lookahead; i++) ref = Math.max(ref, this.playbackPeaks[i]!);
+    let inboundPeak = 0;
+    for (const s of inbound) inboundPeak = Math.max(inboundPeak, Math.abs(s));
+    return inboundPeak < ECHO_SUPPRESSION_RATIO * ref;
+  }
+
   private onMediaFrame(payloadB64: string): void {
-    const pcm8k = mulawDecode(fromBase64(payloadB64));
+    const decoded = mulawDecode(fromBase64(payloadB64));
     const frameStartMs = this.mediaClockMs;
-    this.mediaClockMs += pcm8k.length / (TELEPHONY_SAMPLE_RATE / 1000);
+    this.mediaClockMs += decoded.length / (TELEPHONY_SAMPLE_RATE / 1000);
+
+    // Echo-judged frames are replaced with silence for both prosody and STT:
+    // our own voice reflecting off the line must not read as caller speech.
+    const pcm8k = this.isEchoFrame(decoded)
+      ? decoded.length === SILENT_8K_FRAME.length
+        ? SILENT_8K_FRAME
+        : new Int16Array(decoded.length)
+      : decoded;
 
     for (const event of this.analyzer.pushFrame(pcm8k, frameStartMs)) {
       this.emit(
@@ -201,6 +255,11 @@ export class CallSession {
     const sayId = this.pendingMarks.get(name);
     if (sayId === undefined) return;
     this.pendingMarks.delete(name);
+    if (this.pendingMarks.size === 0) {
+      // Everything sent has played; nothing left to echo.
+      this.playbackPeaks = [];
+      this.recentPlayedPeaks = [];
+    }
     this.emit({ type: 'say.completed', id: sayId });
   }
 
@@ -245,6 +304,19 @@ export class CallSession {
       // 24kHz chunks, so there are no seams between them.
       const downsampler = new StreamingDownsampler24kTo8k();
       let started = false;
+      // Hold the first PREBUFFER_FRAMES before releasing anything, so a TTS
+      // generation stall at utterance start cannot leave playback running dry.
+      let prebuffer: Uint8Array[] | null = [];
+      const release = (frame: Uint8Array): void => {
+        if (prebuffer) {
+          prebuffer.push(frame);
+          if (prebuffer.length < PREBUFFER_FRAMES) return;
+          for (const buffered of prebuffer) this.writeOutboundFrame(buffered);
+          prebuffer = null;
+          return;
+        }
+        this.writeOutboundFrame(frame);
+      };
       for await (const pcm24k of stream) {
         if (abort.signal.aborted) break;
         const mulawBytes = mulawEncode(downsampler.push(pcm24k));
@@ -252,13 +324,13 @@ export class CallSession {
           started = true;
           this.emit({ type: 'say.started', id: say.id });
         }
-        for (const frame of chunker.push(mulawBytes)) {
-          this.mediaSocket?.writeMediaFrame(frame);
-        }
+        for (const frame of chunker.push(mulawBytes)) release(frame);
       }
       if (!abort.signal.aborted) {
         const tail = chunker.flush();
-        if (tail) this.mediaSocket?.writeMediaFrame(tail);
+        if (tail) prebuffer?.push(tail);
+        if (prebuffer) for (const buffered of prebuffer) this.writeOutboundFrame(buffered);
+        if (!prebuffer && tail) this.writeOutboundFrame(tail);
         if (!started) this.emit({ type: 'say.started', id: say.id });
         const markName = `say-${say.id}`;
         this.pendingMarks.set(markName, say.id);
@@ -274,7 +346,17 @@ export class CallSession {
     }
   }
 
+  private writeOutboundFrame(frame: Uint8Array): void {
+    let peak = 0;
+    for (const s of mulawDecode(frame)) peak = Math.max(peak, Math.abs(s));
+    this.playbackPeaks.push(peak);
+    this.mediaSocket?.writeMediaFrame(frame);
+  }
+
   private clearSays(reason: 'clear' | 'hangup'): void {
+    // Twilio empties its buffer on clear; nothing of ours remains to echo.
+    this.playbackPeaks = [];
+    this.recentPlayedPeaks = [];
     const abortedIds: string[] = [];
     if (this.currentSay) {
       abortedIds.push(this.currentSay.id);

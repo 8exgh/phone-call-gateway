@@ -6,6 +6,7 @@ import { CallRegistry } from './call/callRegistry';
 import { CallSession } from './call/callSession';
 import { handleControlConnection } from './call/controlSocket';
 import { Orchestrator, type ConversationTurn } from './orchestrator/orchestrator';
+import type { ServerMessage } from './protocol/messages';
 import type { ChatClient } from './orchestrator/chatClient';
 import type { SpeechSynthesizer } from './speech/synthesizer';
 import type { TranscriberFactory } from './speech/transcriber';
@@ -62,6 +63,33 @@ interface OrchestrationRecord {
   liveTranscript: string[];
   /** In-call error events (e.g. stt_failed), so failures are visible when polling. */
   errors: string[];
+  /** Compact timeline of every control event, for post-call diagnosis. */
+  events: string[];
+}
+
+const EVENT_TIMELINE_LIMIT = 800;
+
+function describeEvent(event: ServerMessage): string {
+  switch (event.type) {
+    case 'call.state':
+      return `call.state ${event.state}${event.reason ? ` (${event.reason})` : ''}`;
+    case 'say.started':
+    case 'say.completed':
+      return `${event.type} ${event.id}`;
+    case 'say.aborted':
+      return `say.aborted ${event.id} (${event.reason})`;
+    case 'speech.started':
+    case 'speech.stopped':
+      return `${event.type} at ${event.atMs}ms`;
+    case 'transcript':
+      return `transcript [${event.volume.class}, ${event.pace.class}] "${event.text}"`;
+    case 'transcript.delta':
+      return `delta "${event.text}"`;
+    case 'error':
+      return `error ${event.code}: ${event.message}`;
+    default:
+      return (event as { type: string }).type;
+  }
 }
 
 export async function buildServer(deps: ServerDeps, config: ServerConfig): Promise<FastifyInstance> {
@@ -226,9 +254,11 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
       turns: [],
       liveTranscript: [],
       errors: [],
+      events: [],
     };
     orchestrations.set(record.id, record);
 
+    const startedAt = Date.now();
     const orchestrator = new Orchestrator({
       controlUrl: `${localWsBase()}/control/${record.id}`,
       chatClient: deps.chatClientFactory(),
@@ -237,6 +267,9 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
       voice: parsed.data.voice,
       turnTimeoutMs: 15_000,
       onEvent: (event) => {
+        if (record.events.length < EVENT_TIMELINE_LIMIT) {
+          record.events.push(`${Date.now() - startedAt}ms ${describeEvent(event)}`);
+        }
         if (event.type === 'transcript') {
           const stutter = event.stutter.detected ? ', stuttering' : '';
           record.liveTranscript.push(
