@@ -22,7 +22,11 @@ export function buildDeps(config: AppConfig, opts: { framePacingMs?: number } = 
         apiKeySecret: config.twilioApiKeySecret,
       }),
       synthesizer: new OpenAiSpeechSynthesizer(config.openAiApiKey!, config.ttsModel, config.ttsVoice),
-      transcriberFactory: new OpenAiTranscriberFactory(config.openAiApiKey!, config.transcribeModel),
+      transcriberFactory: new OpenAiTranscriberFactory(
+        config.openAiApiKey!,
+        config.transcribeModel,
+        config.transcribeLanguage,
+      ),
       chatClientFactory: () => new OpenAiChatClient(config.openAiApiKey!, config.chatModel),
     };
   }

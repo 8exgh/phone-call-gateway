@@ -24,6 +24,7 @@ class OpenAiTranscriberSession implements TranscriberSession {
   constructor(
     private readonly apiKey: string,
     private readonly model: string,
+    private readonly language: string,
     private readonly callbacks: TranscriberCallbacks,
   ) {
     this.connect();
@@ -48,7 +49,13 @@ class OpenAiTranscriberSession implements TranscriberSession {
             audio: {
               input: {
                 format: { type: 'audio/pcm', rate: 24000 },
-                transcription: { model: this.model },
+                transcription: {
+                  model: this.model,
+                  // A language hint stops the model language-hopping on
+                  // noisy phone-band audio.
+                  ...(this.language ? { language: this.language } : {}),
+                },
+                noise_reduction: { type: 'near_field' },
                 turn_detection: { type: 'server_vad', silence_duration_ms: 300 },
               },
             },
@@ -152,9 +159,10 @@ export class OpenAiTranscriberFactory implements TranscriberFactory {
   constructor(
     private readonly apiKey: string,
     private readonly model: string,
+    private readonly language: string,
   ) {}
 
   create(callbacks: TranscriberCallbacks): TranscriberSession {
-    return new OpenAiTranscriberSession(this.apiKey, this.model, callbacks);
+    return new OpenAiTranscriberSession(this.apiKey, this.model, this.language, callbacks);
   }
 }

@@ -13,6 +13,8 @@ const envSchema = z.object({
   TTS_MODEL: z.string().default('gpt-4o-mini-tts'),
   TTS_VOICE: z.string().default('alloy'),
   TRANSCRIBE_MODEL: z.string().default('gpt-4o-mini-transcribe'),
+  /** ISO-639-1 hint for STT; empty string = auto-detect. */
+  TRANSCRIBE_LANGUAGE: z.string().default('en'),
   CHAT_MODEL: z.string().default('gpt-4o-mini'),
 });
 
@@ -31,6 +33,7 @@ export interface AppConfig {
   ttsModel: string;
   ttsVoice: string;
   transcribeModel: string;
+  transcribeLanguage: string;
   chatModel: string;
 }
 
@@ -74,6 +77,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     ttsModel: parsed.TTS_MODEL,
     ttsVoice: parsed.TTS_VOICE,
     transcribeModel: parsed.TRANSCRIBE_MODEL,
+    transcribeLanguage: parsed.TRANSCRIBE_LANGUAGE,
     chatModel: parsed.CHAT_MODEL,
   };
 }

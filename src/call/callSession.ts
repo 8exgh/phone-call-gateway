@@ -2,7 +2,7 @@ import type { WebSocket } from 'ws';
 import { MediaSocket } from './mediaSocket';
 import { ProsodyAnalyzer } from '../prosody/prosodyAnalyzer';
 import { decode as mulawDecode, encode as mulawEncode, MULAW_SILENCE } from '../audio/mulaw';
-import { upsample8kTo24k, downsample24kTo8k } from '../audio/resample';
+import { StreamingUpsampler8kTo24k, StreamingDownsampler24kTo8k } from '../audio/resample';
 import { fromBase64, FrameChunker, MULAW_FRAME_BYTES, TELEPHONY_SAMPLE_RATE } from '../audio/frames';
 import type { SpeechSynthesizer } from '../speech/synthesizer';
 import type { TranscriberFactory, TranscriberSession } from '../speech/transcriber';
@@ -36,6 +36,7 @@ export class CallSession {
   private eventBuffer: ServerMessage[] = [];
 
   private readonly analyzer = new ProsodyAnalyzer();
+  private readonly inboundUpsampler = new StreamingUpsampler8kTo24k();
   private mediaClockMs = 0;
 
   private transcriber: TranscriberSession | null = null;
@@ -188,7 +189,7 @@ export class CallSession {
       );
     }
 
-    const pcm24k = upsample8kTo24k(pcm8k);
+    const pcm24k = this.inboundUpsampler.push(pcm8k);
     if (this.transcriber) {
       this.transcriber.sendAudio(pcm24k);
     } else if (this.pendingTranscriberAudio.length < 500) {
@@ -240,18 +241,13 @@ export class CallSession {
         signal: abort.signal,
       });
       const chunker = new FrameChunker(MULAW_FRAME_BYTES, MULAW_SILENCE);
-      // 24kHz chunks arrive at arbitrary sizes; carry the remainder that
-      // doesn't fill a 3-sample decimation group across chunks.
-      let carry = new Int16Array(0);
+      // Streaming decimator carries filter state across the arbitrary-size
+      // 24kHz chunks, so there are no seams between them.
+      const downsampler = new StreamingDownsampler24kTo8k();
       let started = false;
       for await (const pcm24k of stream) {
         if (abort.signal.aborted) break;
-        const combined = new Int16Array(carry.length + pcm24k.length);
-        combined.set(carry);
-        combined.set(pcm24k, carry.length);
-        const usable = combined.length - (combined.length % 3);
-        carry = combined.slice(usable);
-        const mulawBytes = mulawEncode(downsample24kTo8k(combined.subarray(0, usable)));
+        const mulawBytes = mulawEncode(downsampler.push(pcm24k));
         if (!started && mulawBytes.length > 0) {
           started = true;
           this.emit({ type: 'say.started', id: say.id });
