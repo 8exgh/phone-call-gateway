@@ -357,14 +357,18 @@ export class CallSession {
     // Twilio empties its buffer on clear; nothing of ours remains to echo.
     this.playbackPeaks = [];
     this.recentPlayedPeaks = [];
-    const abortedIds: string[] = [];
+    const abortedIds = new Set<string>();
     if (this.currentSay) {
-      abortedIds.push(this.currentSay.id);
+      abortedIds.add(this.currentSay.id);
       this.currentSay.abort.abort();
       this.currentSay = null;
     }
-    for (const queued of this.sayQueue) abortedIds.push(queued.id);
+    for (const queued of this.sayQueue) abortedIds.add(queued.id);
     this.sayQueue = [];
+    // Says fully written but still playing out of Twilio's buffer lose their
+    // remaining audio to the clear as well; without an aborted event for them
+    // the client would wait forever for a say.completed that can never come.
+    for (const sayId of this.pendingMarks.values()) abortedIds.add(sayId);
     this.pendingMarks.clear();
     this.mediaSocket?.sendClear();
     for (const id of abortedIds) {

@@ -54,6 +54,32 @@ describe('TTS path', () => {
     control.close();
   });
 
+  it('a clear during buffered playback (audio fully sent, mark pending) reports say.aborted', async () => {
+    gw = await startGateway({ script: [{ pauseMs: 100 }] });
+    const { control, media } = await activeCall();
+
+    const text = 'this utterance is long enough that playback outlives synthesis by a lot';
+    control.send({ type: 'say', id: 'buffered', text });
+    await control.waitFor((m) => m.type === 'say.started' && m.id === 'buffered');
+    // Wait until every frame has been SENT (synthesis done, currentSay gone)
+    // while playback of the buffered audio is still in progress.
+    const expectedMs = fakeSynthesisDurationMs(text);
+    await until(() => outboundDurationMs(media) >= expectedMs);
+
+    control.send({ type: 'clear' });
+    const aborted = await control.waitFor((m) => m.type === 'say.aborted' && m.id === 'buffered');
+    expect(aborted).toMatchObject({ reason: 'clear' });
+    // The mark Twilio flushes back after the clear must not surface as a
+    // completion for the aborted say.
+    control.send({ type: 'say', id: 'after', text: 'still alive' });
+    await control.waitFor((m) => m.type === 'say.completed' && m.id === 'after');
+    expect(control.events.some((m) => m.type === 'say.completed' && m.id === 'buffered')).toBe(false);
+
+    control.send({ type: 'hangup' });
+    await control.waitFor((m) => m.type === 'call.state' && m.state === 'ended');
+    control.close();
+  });
+
   it('plays queued says in FIFO order', async () => {
     gw = await startGateway({ script: [{ pauseMs: 100 }] });
     const { control } = await activeCall();
