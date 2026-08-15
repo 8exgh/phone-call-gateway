@@ -96,6 +96,8 @@ function describeEvent(event: ServerMessage): string {
       return `transcript [${event.volume.class}, ${event.pace.class}] "${event.text}"`;
     case 'transcript.delta':
       return `delta "${event.text}"`;
+    case 'dtmf':
+      return `dtmf ${event.digit} at ${event.atMs}ms`;
     case 'error':
       return `error ${event.code}: ${event.message}`;
     default:
@@ -323,6 +325,8 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
           record.liveTranscript.push(
             `[${event.volume.class}, ${event.pace.class}${stutter}] ${event.text}`,
           );
+        } else if (event.type === 'dtmf') {
+          record.liveTranscript.push(`[key] ${event.digit}`);
         } else if (event.type === 'error') {
           record.errors.push(`${event.code}: ${event.message}`);
         }

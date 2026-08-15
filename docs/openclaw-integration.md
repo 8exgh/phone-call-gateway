@@ -80,6 +80,11 @@ Poll every few seconds until `status` is `ended` or `failed`:
   once it ends. Caller turns carry prosody annotations
   (`volume: whisper|normal|loud|yell`, `pace: calm|slow|normal|fast`,
   `stuttering`) — use them when judging how the call went.
+- **IVR menus / keypad (DTMF)**: the voice agent can both press keys and hear
+  them. Write goals like "navigate the menu: press 2 for billing, then ask
+  about the invoice" — the agent dials keys itself (they appear as
+  `[pressed 2]` agent turns). Keys the other side presses appear as
+  `[pressed 42]` caller turns and as `[key] 4` lines in `liveTranscript`.
 - `reason`: `hangup` = our agent ended it, `remote_hangup` = they did.
 - `errors` lists in-call failures (e.g. `stt_failed`); `events` is a full
   timeline for debugging.
@@ -101,13 +106,18 @@ curl -s -X POST "$PHONE_GATEWAY_URL/calls" -H 'content-type: application/json' \
 Connect one WebSocket client to `wss://…/control/<callId>` and speak JSON:
 
 Client → server: `{"type":"say","id":"s1","text":"…","voice?":"…","instructions?":"…"}`
-(FIFO queue), `{"type":"clear"}` (barge-in: abort current+queued audio),
+(FIFO queue), `{"type":"sendDigits","id":"d1","digits":"1w2#"}` (DTMF keys
+0-9 A-D * #, `w` = half-second pause; queued in order with says and played as
+in-band tones), `{"type":"clear"}` (barge-in: abort current+queued audio),
 `{"type":"hangup"}`.
 
 Server → client: `call.state` (dialing/active/ending/ended/failed),
 `say.started|say.completed|say.aborted` (completed = actually finished playing
-on the phone), `speech.started|speech.stopped` (voice activity),
-`transcript.delta` (partials), `transcript` (final text + prosody), `error`.
+on the phone; sendDigits shares these events by id),
+`speech.started|speech.stopped` (voice activity), `transcript.delta`
+(partials), `transcript` (final text + prosody), `dtmf`
+(`{"type":"dtmf","digit":"4","atMs":12340}` — the remote party pressed a key),
+`error`.
 
 ## Phone numbers
 

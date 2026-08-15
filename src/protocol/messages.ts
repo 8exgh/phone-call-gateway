@@ -19,6 +19,18 @@ export const sayMessageSchema = z.object({
   instructions: z.string().optional(),
 });
 
+export const sendDigitsMessageSchema = z.object({
+  type: z.literal('sendDigits'),
+  /** Client-chosen id, echoed back in say.* lifecycle events like a say. */
+  id: z.string().min(1),
+  /** DTMF keys 0-9 A-D * #; 'w' pauses half a second (Twilio convention). */
+  digits: z
+    .string()
+    .min(1)
+    .max(32)
+    .regex(/^[0-9A-Da-d*#wW]+$/, 'digits must be DTMF keys (0-9 A-D * # w)'),
+});
+
 export const clearMessageSchema = z.object({
   type: z.literal('clear'),
 });
@@ -29,11 +41,13 @@ export const hangupMessageSchema = z.object({
 
 export const clientMessageSchema = z.discriminatedUnion('type', [
   sayMessageSchema,
+  sendDigitsMessageSchema,
   clearMessageSchema,
   hangupMessageSchema,
 ]);
 
 export type SayMessage = z.infer<typeof sayMessageSchema>;
+export type SendDigitsMessage = z.infer<typeof sendDigitsMessageSchema>;
 export type ClientMessage = z.infer<typeof clientMessageSchema>;
 
 // ---------- Server -> client ----------
@@ -103,6 +117,14 @@ export const transcriptDeltaMessageSchema = z.object({
   text: z.string(),
 });
 
+/** The remote party pressed a keypad key. */
+export const dtmfMessageSchema = z.object({
+  type: z.literal('dtmf'),
+  digit: z.string().length(1),
+  /** Media-clock milliseconds. */
+  atMs: z.number(),
+});
+
 export const errorMessageSchema = z.object({
   type: z.literal('error'),
   code: z.enum([
@@ -125,6 +147,7 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
   speechStoppedMessageSchema,
   transcriptMessageSchema,
   transcriptDeltaMessageSchema,
+  dtmfMessageSchema,
   errorMessageSchema,
 ]);
 

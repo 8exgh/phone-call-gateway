@@ -29,6 +29,8 @@ export type CallerScriptStep =
   | { waitForSayCompleted: true }
   /** Stream silence until the gateway has sent at least this much total audio (media-clock ms). */
   | { waitForAgentAudioMs: number }
+  /** Press keypad keys: one dtmf event per character, as Twilio sends them. */
+  | { pressDigits: string }
   | { hangup: true };
 
 export type CallerScript = CallerScriptStep[];

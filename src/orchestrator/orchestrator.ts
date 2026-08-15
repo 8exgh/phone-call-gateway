@@ -21,6 +21,8 @@ export interface OrchestratorOptions {
   voice?: string;
   /** ms of caller silence (after our say completes) before re-engaging; 0 disables. */
   turnTimeoutMs?: number;
+  /** ms to wait after the last keypress before handing the digits to the LLM. */
+  dtmfFlushMs?: number;
   /** Observer for every server event (used by the CLI for live printing). */
   onEvent?: (event: ServerMessage) => void;
 }
@@ -85,7 +87,12 @@ You are speaking on a live phone call. Reply with exactly what you will say out 
 natural, conversational sentences. No stage directions, no markdown, no surrounding quotation
 marks. The caller's turns are prefixed with an annotation of how they spoke (volume, pace,
 stuttering) — adapt to it.
+To press phone keypad keys (IVR menus: "press 1 for..."), include PRESS(digits) in your reply,
+e.g. PRESS(1) or PRESS(123#); use w for a half-second pause, e.g. PRESS(1w2). The keys are
+dialed after your spoken sentences. [caller pressed keys: ...] turns tell you what THEY dialed.
 When the conversation should end, include the word ${HANGUP_MARKER} anywhere in your reply.`;
+
+const PRESS_PATTERN = /PRESS\(([0-9A-Da-d*#wW]{1,32})\)/g;
 
 /**
  * A control-socket client that drives a call with an LLM: transcripts (with
@@ -106,6 +113,8 @@ export class Orchestrator {
   private finished = false;
   /** Bumped on every barge-in; says from an older generation are stale. */
   private bargeInGeneration = 0;
+  private dtmfBuffer = '';
+  private dtmfTimer: NodeJS.Timeout | null = null;
   private resolveRun: ((result: CallResult) => void) | null = null;
 
   constructor(private readonly opts: OrchestratorOptions) {
@@ -125,10 +134,24 @@ export class Orchestrator {
     });
   }
 
+  private flushDtmf(): void {
+    if (this.dtmfTimer) {
+      clearTimeout(this.dtmfTimer);
+      this.dtmfTimer = null;
+    }
+    if (this.dtmfBuffer.length === 0 || this.finished) return;
+    const keys = this.dtmfBuffer;
+    this.dtmfBuffer = '';
+    this.turns.push({ role: 'caller', text: `[pressed ${keys}]` });
+    this.pendingUserTexts.push(`[caller pressed keys: ${keys}]`);
+    void this.respond();
+  }
+
   private finish(finalState: 'ended' | 'failed', reason?: string): void {
     if (this.finished) return;
     this.finished = true;
     this.disarmSilenceTimer();
+    if (this.dtmfTimer) clearTimeout(this.dtmfTimer);
     this.resolveRun?.({ finalState, reason, turns: this.turns });
     this.ws?.close();
   }
@@ -150,6 +173,14 @@ export class Orchestrator {
         if (msg.state === 'active') this.onCallActive();
         if (msg.state === 'ended') this.finish('ended', msg.reason);
         if (msg.state === 'failed') this.finish('failed', msg.reason);
+        break;
+      case 'dtmf':
+        this.disarmSilenceTimer();
+        // Keys often come in bursts (extensions, PINs): buffer briefly and
+        // hand the LLM the whole sequence as one turn.
+        this.dtmfBuffer += msg.digit;
+        if (this.dtmfTimer) clearTimeout(this.dtmfTimer);
+        this.dtmfTimer = setTimeout(() => this.flushDtmf(), this.opts.dtmfFlushMs ?? 1200);
         break;
       case 'transcript': {
         const recentAgentTexts = this.turns
@@ -210,7 +241,7 @@ export class Orchestrator {
       ) {
         const userContent = this.pendingUserTexts.splice(0).join('\n');
         this.history.push({ role: 'user', content: userContent });
-        let reply: { full: string; lastSayId: string | null };
+        let reply: { full: string; lastSayId: string | null; pressed: string[] };
         try {
           reply = await this.streamReply();
         } catch (error) {
@@ -221,9 +252,16 @@ export class Orchestrator {
         }
         this.history.push({ role: 'assistant', content: reply.full });
         const wantsHangup = reply.full.includes(HANGUP_MARKER);
-        const spokenFull = reply.full.replaceAll(HANGUP_MARKER, '').replace(/\s+/g, ' ').trim();
+        const spokenFull = reply.full
+          .replaceAll(HANGUP_MARKER, '')
+          .replace(PRESS_PATTERN, '')
+          .replace(/\s+/g, ' ')
+          .trim();
         if (spokenFull.length > 0) {
           this.turns.push({ role: 'agent', text: spokenFull });
+        }
+        for (const digits of reply.pressed) {
+          this.turns.push({ role: 'agent', text: `[pressed ${digits}]` });
         }
         if (wantsHangup) {
           if (reply.lastSayId) this.hangupAfterSayId = reply.lastSayId;
@@ -243,13 +281,21 @@ export class Orchestrator {
    * first sentence plays while the rest is still generating. Falls back to a
    * single say when the chat client cannot stream.
    */
-  private async streamReply(): Promise<{ full: string; lastSayId: string | null }> {
+  private async streamReply(): Promise<{
+    full: string;
+    lastSayId: string | null;
+    pressed: string[];
+  }> {
     const generation = this.bargeInGeneration;
     let full = '';
     let buffer = '';
     let lastSayId: string | null = null;
     const flush = (text: string): void => {
-      const spoken = text.replaceAll(HANGUP_MARKER, '').replace(/\s+/g, ' ').trim();
+      const spoken = text
+        .replaceAll(HANGUP_MARKER, '')
+        .replace(PRESS_PATTERN, '')
+        .replace(/\s+/g, ' ')
+        .trim();
       if (spoken.length === 0) return;
       // A barge-in or hangup makes the rest of this reply stale: stay quiet.
       if (this.finished || this.bargeInGeneration !== generation) return;
@@ -270,7 +316,18 @@ export class Orchestrator {
       }
     }
     flush(buffer);
-    return { full, lastSayId };
+    // Keypad presses the LLM asked for are dialed after its spoken sentences
+    // (the say queue preserves order).
+    const pressed: string[] = [];
+    for (const match of full.matchAll(PRESS_PATTERN)) {
+      if (this.finished || this.bargeInGeneration !== generation) break;
+      const id = `say-${++this.sayCounter}`;
+      this.saysInFlight.add(id);
+      this.send({ type: 'sendDigits', id, digits: match[1]! });
+      pressed.push(match[1]!);
+      lastSayId = id;
+    }
+    return { full, lastSayId, pressed };
   }
 
   private say(rawText: string, opts: { recordTurn?: boolean } = {}): string {

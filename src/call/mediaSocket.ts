@@ -5,6 +5,7 @@ export interface MediaSocketHandlers {
   onStart(streamSid: string, providerCallSid?: string): void;
   onMedia(payloadB64: string): void;
   onMark(name: string): void;
+  onDtmf(digit: string): void;
   onStop(): void;
   onClose(): void;
 }
@@ -66,11 +67,16 @@ export class MediaSocket {
         if (typeof name === 'string') this.handlers.onMark(name);
         break;
       }
+      case 'dtmf': {
+        const digit = (msg as { dtmf?: { digit?: unknown } }).dtmf?.digit;
+        if (typeof digit === 'string' && digit.length === 1) this.handlers.onDtmf(digit);
+        break;
+      }
       case 'stop':
         this.handlers.onStop();
         break;
       default:
-        // dtmf and future event types: ignore.
+        // Future event types: ignore.
         break;
     }
   }

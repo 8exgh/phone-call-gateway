@@ -7,7 +7,14 @@ import { fromBase64, FrameChunker, MULAW_FRAME_BYTES, TELEPHONY_SAMPLE_RATE } fr
 import type { SpeechSynthesizer } from '../speech/synthesizer';
 import type { TranscriberFactory, TranscriberSession } from '../speech/transcriber';
 import type { TwilioApi } from '../telephony/twilioApi';
-import type { CallState, ClientMessage, SayMessage, ServerMessage } from '../protocol/messages';
+import { generateDtmf } from '../audio/dtmf';
+import type {
+  CallState,
+  ClientMessage,
+  SayMessage,
+  SendDigitsMessage,
+  ServerMessage,
+} from '../protocol/messages';
 
 export interface CallSessionDeps {
   synthesizer: SpeechSynthesizer;
@@ -64,7 +71,7 @@ export class CallSession {
   private transcriberPending = false;
   private pendingTranscriberAudio: Int16Array[] = [];
 
-  private sayQueue: SayMessage[] = [];
+  private sayQueue: (SayMessage | SendDigitsMessage)[] = [];
   private currentSay: { id: string; abort: AbortController } | null = null;
   private processingSayQueue = false;
   /** markName -> sayId, awaiting Twilio's playback acknowledgement. */
@@ -136,6 +143,7 @@ export class CallSession {
   handleControlMessage(msg: ClientMessage): void {
     switch (msg.type) {
       case 'say':
+      case 'sendDigits':
         if (this.state === 'ending' || this.state === 'ended' || this.state === 'failed') {
           this.emit({ type: 'error', code: 'call_failed', message: `call is ${this.state}` });
           return;
@@ -167,6 +175,7 @@ export class CallSession {
       onStart: (_streamSid, providerCallSid) => this.onMediaStart(providerCallSid),
       onMedia: (payloadB64) => this.onMediaFrame(payloadB64),
       onMark: (name) => this.onMediaMark(name),
+      onDtmf: (digit) => this.emit({ type: 'dtmf', digit, atMs: this.mediaClockMs }),
       onStop: () => this.onMediaStop(),
       onClose: () => this.onMediaClose(),
     });
@@ -283,8 +292,9 @@ export class CallSession {
     this.processingSayQueue = true;
     try {
       while (this.sayQueue.length > 0 && this.state === 'active' && this.mediaSocket) {
-        const say = this.sayQueue.shift()!;
-        await this.playSay(say);
+        const item = this.sayQueue.shift()!;
+        if (item.type === 'sendDigits') this.playDigits(item);
+        else await this.playSay(item);
       }
     } finally {
       this.processingSayQueue = false;
@@ -345,6 +355,23 @@ export class CallSession {
     } finally {
       this.currentSay = null;
     }
+  }
+
+  /**
+   * Play a DTMF digit string into the call. Rendered in one shot (no TTS
+   * stream to await); shares the say lifecycle events, mark tracking, and the
+   * echo gate's peak accounting.
+   */
+  private playDigits(msg: SendDigitsMessage): void {
+    const chunker = new FrameChunker(MULAW_FRAME_BYTES, MULAW_SILENCE);
+    const mulawBytes = mulawEncode(generateDtmf(msg.digits));
+    this.emit({ type: 'say.started', id: msg.id });
+    for (const frame of chunker.push(mulawBytes)) this.writeOutboundFrame(frame);
+    const tail = chunker.flush();
+    if (tail) this.writeOutboundFrame(tail);
+    const markName = `say-${msg.id}`;
+    this.pendingMarks.set(markName, msg.id);
+    this.mediaSocket?.sendMark(markName);
   }
 
   private writeOutboundFrame(frame: Uint8Array): void {

@@ -206,6 +206,17 @@ export class FakeTwilioMediaClient {
         }
         return null; // keep streaming silence while we wait
       }
+      if ('pressDigits' in step) {
+        this.script.shift();
+        for (const digit of step.pressDigits) {
+          this.send({
+            event: 'dtmf',
+            streamSid: this.opts.streamSid,
+            dtmf: { track: 'inbound_track', digit },
+          });
+        }
+        continue;
+      }
       if ('waitForAgentAudioMs' in step) {
         const outboundMs = this.capturedOutbound.reduce((sum, f) => sum + f.length, 0) / 8;
         if (outboundMs >= step.waitForAgentAudioMs) {
