@@ -25,6 +25,7 @@ class OpenAiTranscriberSession implements TranscriberSession {
     private readonly apiKey: string,
     private readonly model: string,
     private readonly language: string,
+    private readonly silenceMs: number,
     private readonly callbacks: TranscriberCallbacks,
   ) {
     this.connect();
@@ -56,7 +57,7 @@ class OpenAiTranscriberSession implements TranscriberSession {
                   ...(this.language ? { language: this.language } : {}),
                 },
                 noise_reduction: { type: 'near_field' },
-                turn_detection: { type: 'server_vad', silence_duration_ms: 300 },
+                turn_detection: { type: 'server_vad', silence_duration_ms: this.silenceMs },
               },
             },
           },
@@ -160,9 +161,16 @@ export class OpenAiTranscriberFactory implements TranscriberFactory {
     private readonly apiKey: string,
     private readonly model: string,
     private readonly language: string,
+    private readonly silenceMs: number,
   ) {}
 
   create(callbacks: TranscriberCallbacks): TranscriberSession {
-    return new OpenAiTranscriberSession(this.apiKey, this.model, this.language, callbacks);
+    return new OpenAiTranscriberSession(
+      this.apiKey,
+      this.model,
+      this.language,
+      this.silenceMs,
+      callbacks,
+    );
   }
 }

@@ -33,8 +33,9 @@ const ECHO_LOOKAHEAD_FRAMES = 10;
 /**
  * Frames of audio to accumulate before releasing an utterance's first frame,
  * so TTS generation jitter cannot make playback run dry at utterance start.
+ * Every frame here is added turn latency, so keep it as small as chop allows.
  */
-const PREBUFFER_FRAMES = 20; // 400ms
+const PREBUFFER_FRAMES = 10; // 200ms
 
 const SILENT_8K_FRAME = new Int16Array(MULAW_FRAME_BYTES);
 

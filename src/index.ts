@@ -26,6 +26,7 @@ export function buildDeps(config: AppConfig, opts: { framePacingMs?: number } = 
         config.openAiApiKey!,
         config.transcribeModel,
         config.transcribeLanguage,
+        config.transcribeSilenceMs,
       ),
       chatClientFactory: () => new OpenAiChatClient(config.openAiApiKey!, config.chatModel),
     };

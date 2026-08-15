@@ -66,9 +66,11 @@ describe('LLM-orchestrated conversation (full E2E)', () => {
     // The angry turn's prosody reached the LLM inline.
     expect(chatClient.receivedUserContents[1]).toMatch(/\[volume: loud, pace: (fast|normal)\]/);
 
-    // All four says completed (none aborted) and the call ended by our hangup.
+    // Replies stream sentence-by-sentence: opening + reply1 + reply2 are one
+    // sentence each, the goodbye reply is two — five says, all completed
+    // (none aborted), and the call ended by our hangup.
     const completed = events.filter((e) => e.type === 'say.completed');
-    expect(completed).toHaveLength(4);
+    expect(completed).toHaveLength(5);
     expect(events.some((e) => e.type === 'say.aborted')).toBe(false);
   });
 

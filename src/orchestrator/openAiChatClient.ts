@@ -15,4 +15,16 @@ export class OpenAiChatClient implements ChatClient {
     });
     return response.choices[0]?.message?.content ?? '';
   }
+
+  async *completeStreaming(messages: ChatMessage[]): AsyncIterable<string> {
+    const stream = await this.client.chat.completions.create({
+      model: this.model,
+      messages,
+      stream: true,
+    });
+    for await (const part of stream) {
+      const delta = part.choices[0]?.delta?.content;
+      if (delta) yield delta;
+    }
+  }
 }

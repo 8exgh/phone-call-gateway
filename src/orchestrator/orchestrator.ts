@@ -104,6 +104,8 @@ export class Orchestrator {
   private hangupAfterSayId: string | null = null;
   private silenceTimer: NodeJS.Timeout | null = null;
   private finished = false;
+  /** Bumped on every barge-in; says from an older generation are stale. */
+  private bargeInGeneration = 0;
   private resolveRun: ((result: CallResult) => void) | null = null;
 
   constructor(private readonly opts: OrchestratorOptions) {
@@ -164,8 +166,12 @@ export class Orchestrator {
       }
       case 'speech.started':
         this.disarmSilenceTimer();
-        // Barge-in: the caller is talking over us; stop our audio.
-        if (this.saysInFlight.size > 0) this.send({ type: 'clear' });
+        // Barge-in: the caller is talking over us; stop our audio and mark
+        // any reply still streaming from the LLM as superseded.
+        if (this.saysInFlight.size > 0) {
+          this.bargeInGeneration++;
+          this.send({ type: 'clear' });
+        }
         break;
       case 'say.completed':
         this.saysInFlight.delete(msg.id);
@@ -204,23 +210,24 @@ export class Orchestrator {
       ) {
         const userContent = this.pendingUserTexts.splice(0).join('\n');
         this.history.push({ role: 'user', content: userContent });
-        let reply: string;
+        let reply: { full: string; lastSayId: string | null };
         try {
-          reply = await this.opts.chatClient.complete([...this.history]);
+          reply = await this.streamReply();
         } catch (error) {
           // An LLM failure shouldn't strand the callee on a silent line.
           this.say('Sorry, something went wrong on my end. Goodbye.');
           this.hangupAfterSayId = `say-${this.sayCounter}`;
           throw error;
         }
-        this.history.push({ role: 'assistant', content: reply });
-        const wantsHangup = reply.includes(HANGUP_MARKER);
-        const spoken = reply.replaceAll(HANGUP_MARKER, '').replace(/\s+/g, ' ').trim();
-        if (spoken.length > 0) {
-          const sayId = this.say(spoken);
-          if (wantsHangup) this.hangupAfterSayId = sayId;
-        } else if (wantsHangup) {
-          this.send({ type: 'hangup' });
+        this.history.push({ role: 'assistant', content: reply.full });
+        const wantsHangup = reply.full.includes(HANGUP_MARKER);
+        const spokenFull = reply.full.replaceAll(HANGUP_MARKER, '').replace(/\s+/g, ' ').trim();
+        if (spokenFull.length > 0) {
+          this.turns.push({ role: 'agent', text: spokenFull });
+        }
+        if (wantsHangup) {
+          if (reply.lastSayId) this.hangupAfterSayId = reply.lastSayId;
+          else this.send({ type: 'hangup' });
         }
       }
     } finally {
@@ -228,13 +235,51 @@ export class Orchestrator {
     }
   }
 
-  private say(rawText: string): string {
+  /** Sentence boundary: terminal punctuation (optionally a closing quote) then whitespace. */
+  private static readonly SENTENCE_BOUNDARY = /[.!?…]["')\]]?\s/;
+
+  /**
+   * Stream the LLM reply, speaking each completed sentence immediately so the
+   * first sentence plays while the rest is still generating. Falls back to a
+   * single say when the chat client cannot stream.
+   */
+  private async streamReply(): Promise<{ full: string; lastSayId: string | null }> {
+    const generation = this.bargeInGeneration;
+    let full = '';
+    let buffer = '';
+    let lastSayId: string | null = null;
+    const flush = (text: string): void => {
+      const spoken = text.replaceAll(HANGUP_MARKER, '').replace(/\s+/g, ' ').trim();
+      if (spoken.length === 0) return;
+      // A barge-in or hangup makes the rest of this reply stale: stay quiet.
+      if (this.finished || this.bargeInGeneration !== generation) return;
+      lastSayId = this.say(spoken, { recordTurn: false });
+    };
+    const source: AsyncIterable<string> | string[] = this.opts.chatClient.completeStreaming
+      ? this.opts.chatClient.completeStreaming([...this.history])
+      : [await this.opts.chatClient.complete([...this.history])];
+    for await (const chunk of source) {
+      full += chunk;
+      buffer += chunk;
+      for (;;) {
+        const match = Orchestrator.SENTENCE_BOUNDARY.exec(buffer);
+        if (!match) break;
+        const cut = match.index + match[0].length;
+        flush(buffer.slice(0, cut));
+        buffer = buffer.slice(cut);
+      }
+    }
+    flush(buffer);
+    return { full, lastSayId };
+  }
+
+  private say(rawText: string, opts: { recordTurn?: boolean } = {}): string {
     // LLMs sometimes wrap replies in quotation marks despite instructions;
     // spoken text must not include them.
     const text = rawText.replace(/^["'“”‘’\s]+|["'“”‘’\s]+$/g, '') || rawText;
     const id = `say-${++this.sayCounter}`;
     this.saysInFlight.add(id);
-    this.turns.push({ role: 'agent', text });
+    if (opts.recordTurn !== false) this.turns.push({ role: 'agent', text });
     this.send({
       type: 'say',
       id,

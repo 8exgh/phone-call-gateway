@@ -33,4 +33,12 @@ export class FakeChatClient implements ChatClient {
     }
     return step.reply;
   }
+
+  /** Streams the scripted reply in ragged chunks, like a real LLM would. */
+  async *completeStreaming(messages: ChatMessage[]): AsyncIterable<string> {
+    const reply = await this.complete(messages);
+    for (let offset = 0; offset < reply.length; offset += 7) {
+      yield reply.slice(offset, offset + 7);
+    }
+  }
 }
