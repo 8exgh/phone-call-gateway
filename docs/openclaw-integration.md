@@ -256,9 +256,10 @@ curl -s "$PHONE_GATEWAY_URL/inbound-config"      # read current policy
 curl -s -X DELETE "$PHONE_GATEWAY_URL/inbound-config"  # stop answering (reject calls)
 ```
 
-The runtime config survives until the gateway restarts; the `INBOUND_GOAL` /
-`INBOUND_OPENING_LINE` env vars provide the boot-time default. With neither
-set, incoming calls are rejected.
+Client personas are persisted (event-sourced) and survive restarts. The
+`INBOUND_GOAL` / `INBOUND_OPENING_LINE` env vars provide the fallback policy
+for numbers not bound to any client. With no applicable policy, incoming
+calls are rejected.
 
 Discover answered calls by polling the list (same shape as your own calls,
 tagged `direction: "inbound"`, `from` = the caller's number):
@@ -271,9 +272,10 @@ curl -s "$PHONE_GATEWAY_URL/orchestrations?direction=inbound"
 ```
 
 Then `GET /orchestrations/<id>` for the full transcript, exactly like an
-outbound call. Poll on your heartbeat and follow up on anything new (records
-are in-memory: history resets when the gateway restarts, so treat the list as
-"recent calls", not an archive).
+outbound call. Poll on your heartbeat and follow up on anything new. Call
+history is event-sourced in SQLite and survives restarts; the polling list
+serves the most recent 500 calls (the full log is kept on disk — admins can
+audit it raw via `GET /events?limit=100&stream=orchestration:<id>`).
 
 Plumbing notes: purchased numbers get their Voice URL pointed at
 `POST /twilio/voice` automatically; Twilio webhook signatures are validated

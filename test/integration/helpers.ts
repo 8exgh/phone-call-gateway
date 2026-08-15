@@ -1,4 +1,7 @@
 import type { AddressInfo } from 'node:net';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import WebSocket from 'ws';
 import { buildServer } from '../../src/server';
 import { FakeTwilioApi } from '../../src/fakes/fakeTwilioApi';
@@ -41,7 +44,8 @@ export async function startGateway(
       chatClientFactory: opts.chatClientFactory ?? (() => new FakeChatClient(demoChatScript)),
       webhookValidator: opts.webhookValidator,
     },
-    { ttsVoice: 'alloy', ...opts.serverConfig },
+    // Fresh event-store dir per gateway so tests never share state or touch ./data.
+    { ttsVoice: 'alloy', dataDir: mkdtempSync(path.join(tmpdir(), 'pgw-test-')), ...opts.serverConfig },
   );
   await app.listen({ port: 0, host: '127.0.0.1' });
   const port = (app.server.address() as AddressInfo).port;

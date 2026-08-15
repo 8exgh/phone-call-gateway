@@ -4,7 +4,9 @@ import formbody from '@fastify/formbody';
 import { randomUUID } from 'node:crypto';
 import { buildRejectTwiml, buildStreamTwiml } from './telephony/twiml';
 import { areaCodeCandidates } from './telephony/areaCodes';
+import { EventStore } from './store/eventStore';
 import { ClientStore, type ClientRecord } from './store/clientStore';
+import { OrchestrationLog, type OrchestrationRecord } from './store/orchestrationLog';
 import { z } from 'zod';
 import { CallRegistry } from './call/callRegistry';
 import { CallSession } from './call/callSession';
@@ -111,27 +113,6 @@ const orchestrationListQuerySchema = z.object({
   status: z.enum(['running', 'ended', 'failed']).optional(),
 });
 
-interface OrchestrationRecord {
-  id: string;
-  direction: 'inbound' | 'outbound';
-  startedAt: string;
-  /** Owning client, when the call belongs to a registered client. */
-  clientId?: string;
-  to: string;
-  from: string;
-  goal: string;
-  status: 'running' | 'ended' | 'failed';
-  reason?: string;
-  /** Full conversation once the call finishes. */
-  turns: ConversationTurn[];
-  /** Caller transcript lines observed so far, with prosody, for live polling. */
-  liveTranscript: string[];
-  /** In-call error events (e.g. stt_failed), so failures are visible when polling. */
-  errors: string[];
-  /** Compact timeline of every control event, for post-call diagnosis. */
-  events: string[];
-}
-
 const EVENT_TIMELINE_LIMIT = 800;
 
 function describeEvent(event: ServerMessage): string {
@@ -179,7 +160,8 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
   const httpsBase = (): string | undefined =>
     config.publicWssUrl?.replace(/\/+$/, '').replace(/^wss/i, 'https').replace(/^ws(?!s)/i, 'http');
 
-  const store = new ClientStore(config.dataDir ?? './data');
+  const eventStore = new EventStore(config.dataDir ?? './data');
+  const store = new ClientStore(eventStore, config.dataDir ?? './data');
 
   type Auth = { kind: 'open' } | { kind: 'admin' } | { kind: 'client'; client: ClientRecord };
 
@@ -485,7 +467,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     }
   });
 
-  const orchestrations = new Map<string, OrchestrationRecord>();
+  const orchestrations = new OrchestrationLog(eventStore);
 
   /** Runtime override of the standing inbound answering policy. */
   let inboundConfig: { goal: string; openingLine?: string; voice?: string } | null =
@@ -500,24 +482,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     to: string;
     from: string;
     goal: string;
-  }): OrchestrationRecord => {
-    const record: OrchestrationRecord = {
-      id: opts.id,
-      direction: opts.direction,
-      startedAt: new Date().toISOString(),
-      ...(opts.clientId ? { clientId: opts.clientId } : {}),
-      to: opts.to,
-      from: opts.from,
-      goal: opts.goal,
-      status: 'running',
-      turns: [],
-      liveTranscript: [],
-      errors: [],
-      events: [],
-    };
-    orchestrations.set(record.id, record);
-    return record;
-  };
+  }): OrchestrationRecord => orchestrations.start(opts);
 
   const runOrchestrator = (
     record: OrchestrationRecord,
@@ -535,31 +500,41 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
       voice: opts.voice,
       turnTimeoutMs: 15_000,
       onEvent: (event) => {
+        // The debug timeline stays in memory while the call runs and is
+        // persisted in one piece with the finished event.
         if (record.events.length < EVENT_TIMELINE_LIMIT) {
           record.events.push(`${Date.now() - startedAt}ms ${describeEvent(event)}`);
         }
         if (event.type === 'transcript') {
           const stutter = event.stutter.detected ? ', stuttering' : '';
-          record.liveTranscript.push(
+          orchestrations.line(
+            record.id,
             `[${event.volume.class}, ${event.pace.class}${stutter}] ${event.text}`,
           );
         } else if (event.type === 'dtmf') {
-          record.liveTranscript.push(`[key] ${event.digit}`);
+          orchestrations.line(record.id, `[key] ${event.digit}`);
         } else if (event.type === 'error') {
-          record.errors.push(`${event.code}: ${event.message}`);
+          orchestrations.error(record.id, `${event.code}: ${event.message}`);
         }
       },
     });
     void orchestrator
       .run()
       .then((result) => {
-        record.status = result.finalState;
-        record.reason = result.reason;
-        record.turns = result.turns;
+        orchestrations.finish(record.id, {
+          status: result.finalState,
+          reason: result.reason,
+          turns: result.turns,
+          timeline: record.events,
+        });
       })
       .catch((error: Error) => {
-        record.status = 'failed';
-        record.reason = error.message;
+        orchestrations.finish(record.id, {
+          status: 'failed',
+          reason: error.message,
+          turns: [],
+          timeline: record.events,
+        });
       });
   };
 
@@ -623,7 +598,8 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid query' });
     }
-    const records = [...orchestrations.values()]
+    const records = orchestrations
+      .list()
       .filter((r) => auth.kind !== 'client' || r.clientId === auth.client.id)
       .filter((r) => !parsed.data.direction || r.direction === parsed.data.direction)
       .filter((r) => !parsed.data.status || r.status === parsed.data.status)
@@ -753,6 +729,22 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
   app.get('/clients', async (req, reply) => {
     if (!requireAdmin(req, reply)) return;
     return store.list();
+  });
+
+  // Raw event-log audit view (admin): the append-only source of truth.
+  app.get('/events', async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    const parsed = z
+      .object({
+        limit: z.coerce.number().int().min(1).max(500).default(100),
+        stream: z.string().optional(),
+      })
+      .safeParse(req.query);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid query' });
+    }
+    const events = eventStore.readRecent(parsed.data.limit, parsed.data.stream);
+    return { count: events.length, events };
   });
 
   app.delete('/clients/:id', async (req, reply) => {

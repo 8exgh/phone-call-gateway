@@ -1,12 +1,13 @@
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, writeFileSync, existsSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync } from 'node:fs';
 import path from 'node:path';
+import type { EventStore } from './eventStore';
 
 /**
- * Multi-tenant client registry. This is the gateway's only durable state:
- * numbers themselves live at Twilio, but WHO owns a number, their API key,
- * their answering persona, and their limits must survive restarts — hence a
- * JSON file on a mounted volume rather than memory.
+ * Client registry as a projection over the event log (CQRS+ES): commands
+ * append client.* events, queries read the in-memory projection rebuilt by
+ * replay at boot. The pre-ES clients.json (if present) is imported into the
+ * log once and renamed aside.
  */
 
 export interface InboundPolicy {
@@ -39,31 +40,69 @@ function slugify(name: string): string {
 }
 
 export class ClientStore {
-  private clients: ClientRecord[] = [];
+  private clients = new Map<string, ClientRecord>();
   private loaded = false;
 
-  constructor(private readonly dataDir: string) {}
+  constructor(
+    private readonly events: EventStore,
+    /** Directory that may hold a legacy clients.json to import. */
+    private readonly legacyDir?: string,
+  ) {}
 
-  private get filePath(): string {
-    return path.join(this.dataDir, 'clients.json');
-  }
-
-  private load(): void {
+  private ensureLoaded(): void {
     if (this.loaded) return;
     this.loaded = true;
-    if (!existsSync(this.filePath)) return;
-    this.clients = JSON.parse(readFileSync(this.filePath, 'utf8')) as ClientRecord[];
+    this.importLegacyJson();
+    for (const event of this.events.readAll('client.')) this.apply(event.type, event.data);
   }
 
-  private save(): void {
-    mkdirSync(this.dataDir, { recursive: true });
-    const tmp = `${this.filePath}.tmp`;
-    writeFileSync(tmp, JSON.stringify(this.clients, null, 2));
-    renameSync(tmp, this.filePath);
+  private importLegacyJson(): void {
+    if (!this.legacyDir) return;
+    const file = path.join(this.legacyDir, 'clients.json');
+    if (!existsSync(file) || this.events.readAll('client.').length > 0) return;
+    const records = JSON.parse(readFileSync(file, 'utf8')) as ClientRecord[];
+    for (const record of records) {
+      this.events.append(`client:${record.id}`, 'client.created', { ...record });
+    }
+    renameSync(file, `${file}.imported`);
+  }
+
+  private apply(type: string, data: Record<string, unknown>): void {
+    switch (type) {
+      case 'client.created': {
+        const record = data as unknown as ClientRecord;
+        this.clients.set(record.id, { ...record });
+        break;
+      }
+      case 'client.updated': {
+        const { id, patch } = data as { id: string; patch: Record<string, unknown> };
+        const record = this.clients.get(id);
+        if (!record) return;
+        for (const [key, value] of Object.entries(patch)) {
+          if (value === null && (key === 'phoneNumber' || key === 'numberSid')) {
+            delete (record as unknown as Record<string, unknown>)[key];
+          } else {
+            (record as unknown as Record<string, unknown>)[key] = value;
+          }
+        }
+        break;
+      }
+      case 'client.removed': {
+        this.clients.delete((data as { id: string }).id);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  private appendAndApply(stream: string, type: string, data: Record<string, unknown>): void {
+    this.events.append(stream, type, data);
+    this.apply(type, data);
   }
 
   create(name: string, phoneNumber?: string): ClientRecord {
-    this.load();
+    this.ensureLoaded();
     if (phoneNumber && this.findByNumber(phoneNumber)) {
       throw new Error(`number ${phoneNumber} is already bound to another client`);
     }
@@ -76,46 +115,45 @@ export class ClientStore {
       inbound: null,
       limits: { ...DEFAULT_LIMITS },
     };
-    this.clients.push(record);
-    this.save();
+    this.appendAndApply(`client:${record.id}`, 'client.created', { ...record });
     return record;
   }
 
   list(): ClientRecord[] {
-    this.load();
-    return [...this.clients];
+    this.ensureLoaded();
+    return [...this.clients.values()];
   }
 
   get(id: string): ClientRecord | undefined {
-    this.load();
-    return this.clients.find((c) => c.id === id);
+    this.ensureLoaded();
+    return this.clients.get(id);
   }
 
   findByApiKey(apiKey: string): ClientRecord | undefined {
-    this.load();
-    return this.clients.find((c) => c.apiKey === apiKey);
+    this.ensureLoaded();
+    return [...this.clients.values()].find((c) => c.apiKey === apiKey);
   }
 
   findByNumber(phoneNumber: string): ClientRecord | undefined {
-    this.load();
-    return this.clients.find((c) => c.phoneNumber === phoneNumber);
+    this.ensureLoaded();
+    return [...this.clients.values()].find((c) => c.phoneNumber === phoneNumber);
   }
 
   update(id: string, patch: Partial<Omit<ClientRecord, 'id' | 'apiKey' | 'createdAt'>>): ClientRecord {
-    this.load();
-    const record = this.clients.find((c) => c.id === id);
-    if (!record) throw new Error(`no client ${id}`);
-    Object.assign(record, patch);
-    this.save();
-    return record;
+    this.ensureLoaded();
+    if (!this.clients.has(id)) throw new Error(`no client ${id}`);
+    // JSON has no undefined: unset fields travel as explicit nulls.
+    const normalized = Object.fromEntries(
+      Object.entries(patch).map(([k, v]) => [k, v === undefined ? null : v]),
+    );
+    this.appendAndApply(`client:${id}`, 'client.updated', { id, patch: normalized });
+    return this.clients.get(id)!;
   }
 
   remove(id: string): boolean {
-    this.load();
-    const index = this.clients.findIndex((c) => c.id === id);
-    if (index === -1) return false;
-    this.clients.splice(index, 1);
-    this.save();
+    this.ensureLoaded();
+    if (!this.clients.has(id)) return false;
+    this.appendAndApply(`client:${id}`, 'client.removed', { id });
     return true;
   }
 }
