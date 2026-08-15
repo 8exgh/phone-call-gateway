@@ -28,10 +28,11 @@ export async function startGateway(
     chatClientFactory?: () => ChatClient;
     serverConfig?: Partial<Parameters<typeof buildServer>[1]>;
     webhookValidator?: Parameters<typeof buildServer>[0]['webhookValidator'];
+    dryAreaCodes?: string[];
   } = {},
 ): Promise<Gateway> {
   const script = opts.script ?? defaultCallerScript;
-  const twilioApi = new FakeTwilioApi({ script, framePacingMs: 0 });
+  const twilioApi = new FakeTwilioApi({ script, framePacingMs: 0, dryAreaCodes: opts.dryAreaCodes });
   const app = await buildServer(
     {
       twilioApi,

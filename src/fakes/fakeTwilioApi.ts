@@ -1,5 +1,6 @@
 import type {
   AvailableNumber,
+  CallRecord,
   CreateCallParams,
   CreatedCall,
   PurchasedNumber,
@@ -18,6 +19,8 @@ export interface FakeTwilioApiOptions {
   framePacingMs?: number;
   /** Delay before the fake callee "answers" (media stream connects). */
   answerDelayMs?: number;
+  /** Area codes that report no available inventory (to exercise overlay fallback). */
+  dryAreaCodes?: string[];
 }
 
 /**
@@ -34,6 +37,7 @@ export class FakeTwilioApi implements TwilioApi {
   constructor(private readonly opts: FakeTwilioApiOptions = {}) {}
 
   async searchNumbers(areaCode: string): Promise<AvailableNumber[]> {
+    if (this.opts.dryAreaCodes?.includes(areaCode)) return [];
     return [0, 1, 2].map((n) => ({
       phoneNumber: `+1${areaCode}555010${n}`,
       locality: 'Mockville',
@@ -122,6 +126,7 @@ export class FakeTwilioApi implements TwilioApi {
       body: params.body,
       status: 'delivered',
       sentAt: new Date().toISOString(),
+      priceUsd: 0.0079,
     };
     this.smsMessages.unshift(message);
     return { sid: message.sid, status: 'queued' };
@@ -137,6 +142,7 @@ export class FakeTwilioApi implements TwilioApi {
       body: opts.body,
       status: 'received',
       sentAt: opts.sentAt ?? new Date().toISOString(),
+      priceUsd: 0.0079,
     };
     this.smsMessages.unshift(message);
     return message;
@@ -147,5 +153,34 @@ export class FakeTwilioApi implements TwilioApi {
     return this.smsMessages
       .filter((m) => Date.parse(m.sentAt) >= cutoff)
       .slice(0, opts.limit ?? 100);
+  }
+
+  /** Seedable provider call history (createCall does not know durations). */
+  readonly callRecords: CallRecord[] = [];
+
+  seedCallRecord(opts: {
+    from: string;
+    to: string;
+    durationSeconds: number;
+    direction?: 'inbound' | 'outbound';
+    priceUsd?: number;
+    startedAt?: string;
+  }): void {
+    this.callRecords.unshift({
+      sid: `CA-seed-${++this.counter}`,
+      direction: opts.direction ?? 'outbound',
+      from: opts.from,
+      to: opts.to,
+      durationSeconds: opts.durationSeconds,
+      priceUsd: opts.priceUsd ?? (opts.durationSeconds / 60) * 0.014,
+      startedAt: opts.startedAt ?? new Date().toISOString(),
+    });
+  }
+
+  async listCalls(opts: { sinceDays: number; limit?: number }): Promise<CallRecord[]> {
+    const cutoff = Date.now() - opts.sinceDays * 24 * 60 * 60 * 1000;
+    return this.callRecords
+      .filter((c) => Date.parse(c.startedAt) >= cutoff)
+      .slice(0, opts.limit ?? 500);
   }
 }

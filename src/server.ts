@@ -1,8 +1,10 @@
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import websocket from '@fastify/websocket';
 import formbody from '@fastify/formbody';
 import { randomUUID } from 'node:crypto';
 import { buildRejectTwiml, buildStreamTwiml } from './telephony/twiml';
+import { areaCodeCandidates } from './telephony/areaCodes';
+import { ClientStore, type ClientRecord } from './store/clientStore';
 import { z } from 'zod';
 import { CallRegistry } from './call/callRegistry';
 import { CallSession } from './call/callSession';
@@ -40,6 +42,15 @@ export interface ServerConfig {
   /** Default standing policy for answering incoming calls; unset = reject them. */
   inboundGoal?: string;
   inboundOpeningLine?: string;
+  /**
+   * Admin password. When set, client endpoints require a bearer token (this
+   * key, or a per-client key from POST /clients). Unset = open mode.
+   */
+  adminApiKey?: string;
+  /** Durable state directory (client registry). Defaults to ./data. */
+  dataDir?: string;
+  /** How long month-usage lookups are cached (default 60s; 0 in tests). */
+  quotaCacheTtlMs?: number;
 }
 
 const areaCodeSchema = z.string().regex(/^\d{3}$/, 'areaCode must be 3 digits');
@@ -81,6 +92,19 @@ const inboundConfigBodySchema = z.object({
   voice: z.string().optional(),
 });
 
+const clientsBodySchema = z.object({
+  name: z.string().min(1).max(60),
+  /** Optionally pre-bind an already-owned number to this client. */
+  phoneNumber: z.string().regex(/^\+\d{8,15}$/).optional(),
+});
+
+const accountingQuerySchema = z.object({
+  days: z.coerce.number().int().min(1).max(90).default(30),
+});
+
+/** Approximate monthly rental for a CA/US local number (Twilio does not expose it per number). */
+const NUMBER_MONTHLY_ESTIMATE_USD = 1.15;
+
 const orchestrationListQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
   direction: z.enum(['inbound', 'outbound']).optional(),
@@ -91,6 +115,8 @@ interface OrchestrationRecord {
   id: string;
   direction: 'inbound' | 'outbound';
   startedAt: string;
+  /** Owning client, when the call belongs to a registered client. */
+  clientId?: string;
   to: string;
   from: string;
   goal: string;
@@ -153,10 +179,71 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
   const httpsBase = (): string | undefined =>
     config.publicWssUrl?.replace(/\/+$/, '').replace(/^wss/i, 'https').replace(/^ws(?!s)/i, 'http');
 
+  const store = new ClientStore(config.dataDir ?? './data');
+
+  type Auth = { kind: 'open' } | { kind: 'admin' } | { kind: 'client'; client: ClientRecord };
+
+  /** Sends the 4xx itself and returns null when the request is not allowed. */
+  const authenticate = (req: FastifyRequest, reply: FastifyReply): Auth | null => {
+    if (!config.adminApiKey) return { kind: 'open' };
+    const header = req.headers.authorization;
+    const token = header?.startsWith('Bearer ') ? header.slice(7) : undefined;
+    if (!token) {
+      reply.code(401).send({ error: 'missing bearer token' });
+      return null;
+    }
+    if (token === config.adminApiKey) return { kind: 'admin' };
+    const client = store.findByApiKey(token);
+    if (!client) {
+      reply.code(401).send({ error: 'invalid token' });
+      return null;
+    }
+    return { kind: 'client', client };
+  };
+
+  const requireAdmin = (req: FastifyRequest, reply: FastifyReply): boolean => {
+    if (!config.adminApiKey) {
+      reply.code(400).send({ error: 'admin endpoints need ADMIN_API_KEY configured' });
+      return false;
+    }
+    const auth = authenticate(req, reply);
+    if (!auth) return false;
+    if (auth.kind !== 'admin') {
+      reply.code(403).send({ error: 'admin token required' });
+      return false;
+    }
+    return true;
+  };
+
+  // ---------- usage quota (provider call history is the source of truth) ----------
+
+  const quotaCacheTtlMs = config.quotaCacheTtlMs ?? 60_000;
+  const quotaCache = new Map<string, { at: number; seconds: number }>();
+
+  const monthCallSeconds = async (phoneNumber: string): Promise<number> => {
+    const cached = quotaCache.get(phoneNumber);
+    if (cached && Date.now() - cached.at < quotaCacheTtlMs) return cached.seconds;
+    const monthPrefix = new Date().toISOString().slice(0, 7); // UTC YYYY-MM
+    const calls = await deps.twilioApi.listCalls({ sinceDays: 32, limit: 1000 });
+    const seconds = calls
+      .filter((c) => c.startedAt.startsWith(monthPrefix))
+      .filter((c) => c.from === phoneNumber || c.to === phoneNumber)
+      .reduce((sum, c) => sum + c.durationSeconds, 0);
+    quotaCache.set(phoneNumber, { at: Date.now(), seconds });
+    return seconds;
+  };
+
+  const overCallQuota = async (client: ClientRecord): Promise<boolean> => {
+    if (!client.phoneNumber) return false;
+    const used = await monthCallSeconds(client.phoneNumber);
+    return used >= client.limits.maxCallHoursPerMonth * 3600;
+  };
+
   app.get('/health', async () => ({ ok: true }));
 
   // Preview candidates in an area code without purchasing anything.
   app.get('/numbers/available', async (req, reply) => {
+    if (!authenticate(req, reply)) return;
     const parsed = z.object({ areaCode: areaCodeSchema }).safeParse(req.query);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid query' });
@@ -164,31 +251,55 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     return deps.twilioApi.searchNumbers(parsed.data.areaCode);
   });
 
-  // Purchase: {areaCode} buys the first available match; {phoneNumber} buys
-  // that exact number (typically picked from GET /numbers/available).
+  // Purchase: {areaCode} buys the first available match — falling back to the
+  // area code's same-city overlays when it is dry (204 -> 431 for Winnipeg);
+  // {phoneNumber} buys that exact number. Under a client token the number is
+  // bound to the client, subject to their number limit.
   app.post('/numbers', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
     const parsed = numbersBodySchema.safeParse(req.body);
     if (!parsed.success) {
       return reply
         .code(400)
         .send({ error: 'body must be {"areaCode": "415"} or {"phoneNumber": "+1..."}' });
     }
+    if (auth.kind === 'client' && auth.client.numberSid) {
+      return reply.code(409).send({
+        error: `number limit reached (max ${auth.client.limits.maxNumbers}): you already have ${auth.client.phoneNumber}`,
+      });
+    }
     let phoneNumber: string;
+    let areaCodeUsed: string | undefined;
     if ('phoneNumber' in parsed.data) {
       phoneNumber = parsed.data.phoneNumber;
     } else {
-      const available = await deps.twilioApi.searchNumbers(parsed.data.areaCode);
-      const first = available[0];
-      if (!first) {
-        return reply
-          .code(404)
-          .send({ error: `no numbers available in area code ${parsed.data.areaCode}` });
+      const candidates = areaCodeCandidates(parsed.data.areaCode);
+      let found: string | undefined;
+      for (const candidate of candidates) {
+        const available = await deps.twilioApi.searchNumbers(candidate);
+        if (available[0]) {
+          found = available[0].phoneNumber;
+          areaCodeUsed = candidate;
+          break;
+        }
       }
-      phoneNumber = first.phoneNumber;
+      if (!found) {
+        return reply.code(404).send({
+          error: `no numbers available in area code ${parsed.data.areaCode} or its overlays (tried ${candidates.join(', ')})`,
+        });
+      }
+      phoneNumber = found;
     }
     try {
       const purchased = await deps.twilioApi.purchaseNumber(phoneNumber);
       ownedNumbers.push(purchased);
+      if (auth.kind === 'client') {
+        store.update(auth.client.id, {
+          phoneNumber: purchased.phoneNumber,
+          numberSid: purchased.sid,
+        });
+      }
       // Point incoming calls at us right away (best effort; the number is
       // usable for outbound even if this fails).
       const base = httpsBase();
@@ -199,7 +310,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
           // Outbound-only until reconfigured; not worth failing the purchase.
         }
       }
-      return purchased;
+      return { ...purchased, ...(areaCodeUsed ? { areaCode: areaCodeUsed } : {}) };
     } catch (error) {
       return reply
         .code(424)
@@ -208,10 +319,21 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
   });
 
   // Source of truth is the provider, so numbers survive gateway restarts.
-  app.get('/numbers', async () => deps.twilioApi.listOwnedNumbers());
+  app.get('/numbers', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
+    const numbers = await deps.twilioApi.listOwnedNumbers();
+    if (auth.kind === 'client') return numbers.filter((n) => n.sid === auth.client.numberSid);
+    return numbers;
+  });
 
   app.delete('/numbers/:sid', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
     const { sid } = req.params as { sid: string };
+    if (auth.kind === 'client' && sid !== auth.client.numberSid) {
+      return reply.code(404).send({ error: 'no such number on your account' });
+    }
     try {
       await deps.twilioApi.releaseNumber(sid);
     } catch (error) {
@@ -219,6 +341,9 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     }
     const index = ownedNumbers.findIndex((n) => n.sid === sid);
     if (index !== -1) ownedNumbers.splice(index, 1);
+    if (auth.kind === 'client') {
+      store.update(auth.client.id, { phoneNumber: undefined, numberSid: undefined });
+    }
     return { released: sid };
   });
 
@@ -228,6 +353,45 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     // The gateway may have restarted since the number was purchased; the
     // provider still knows what we own.
     return (await deps.twilioApi.listOwnedNumbers())[0]?.phoneNumber;
+  };
+
+  /** Per-auth from-number: clients are pinned to their registered number. */
+  const resolveFromFor = async (
+    auth: Auth,
+    explicit: string | undefined,
+    reply: FastifyReply,
+  ): Promise<string | null> => {
+    if (auth.kind === 'client') {
+      if (!auth.client.phoneNumber) {
+        reply.code(400).send({ error: 'no number registered: POST /numbers {"areaCode": "..."} first' });
+        return null;
+      }
+      if (explicit && explicit !== auth.client.phoneNumber) {
+        reply.code(403).send({ error: `from must be your registered number ${auth.client.phoneNumber}` });
+        return null;
+      }
+      return auth.client.phoneNumber;
+    }
+    const from = await resolveFrom(explicit);
+    if (!from) {
+      reply
+        .code(400)
+        .send({ error: 'no from number: register one via POST /numbers or set TWILIO_FROM_NUMBER' });
+      return null;
+    }
+    return from;
+  };
+
+  /** Sends the 429 itself when the client's monthly call hours are spent. */
+  const checkCallQuota = async (auth: Auth, reply: FastifyReply): Promise<boolean> => {
+    if (auth.kind !== 'client') return true;
+    if (await overCallQuota(auth.client)) {
+      reply.code(429).send({
+        error: `monthly call time limit reached (${auth.client.limits.maxCallHoursPerMonth}h)`,
+      });
+      return false;
+    }
+    return true;
   };
 
   const startCall = async (
@@ -264,16 +428,15 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
   };
 
   app.post('/calls', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
     const parsed = callsBodySchema.safeParse(req.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid body' });
     }
-    const from = await resolveFrom(parsed.data.from);
-    if (!from) {
-      return reply
-        .code(400)
-        .send({ error: 'no from number: register one via POST /numbers or set TWILIO_FROM_NUMBER' });
-    }
+    const from = await resolveFromFor(auth, parsed.data.from, reply);
+    if (!from) return;
+    if (!(await checkCallQuota(auth, reply))) return;
     const started = await startCall(parsed.data.to, from);
     if (!started.ok) {
       return reply.code(424).send({ error: started.error, callId: started.callId });
@@ -282,16 +445,14 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
   });
 
   app.post('/sms', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
     const parsed = smsBodySchema.safeParse(req.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid body' });
     }
-    const from = await resolveFrom(parsed.data.from);
-    if (!from) {
-      return reply
-        .code(400)
-        .send({ error: 'no from number: register one via POST /numbers or set TWILIO_FROM_NUMBER' });
-    }
+    const from = await resolveFromFor(auth, parsed.data.from, reply);
+    if (!from) return;
     try {
       const sent = await deps.twilioApi.sendSms({ to: parsed.data.to, from, body: parsed.data.body });
       return { sid: sent.sid, status: sent.status, to: parsed.data.to, from, body: parsed.data.body };
@@ -303,15 +464,21 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
   // Message history, both directions (default: last 30 days). Inbound SMS
   // appear here with no webhook needed, so this is also how you "receive".
   app.get('/sms', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
     const parsed = smsQuerySchema.safeParse(req.query);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid query' });
     }
     try {
-      const messages = await deps.twilioApi.listSms({
+      let messages = await deps.twilioApi.listSms({
         sinceDays: parsed.data.days,
         limit: parsed.data.limit,
       });
+      if (auth.kind === 'client') {
+        const n = auth.client.phoneNumber;
+        messages = n ? messages.filter((m) => m.from === n || m.to === n) : [];
+      }
       return { days: parsed.data.days, count: messages.length, messages };
     } catch (error) {
       return reply.code(424).send({ error: `sms list failed: ${(error as Error).message}` });
@@ -329,6 +496,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
   const createOrchestrationRecord = (opts: {
     id: string;
     direction: 'inbound' | 'outbound';
+    clientId?: string;
     to: string;
     from: string;
     goal: string;
@@ -337,6 +505,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
       id: opts.id,
       direction: opts.direction,
       startedAt: new Date().toISOString(),
+      ...(opts.clientId ? { clientId: opts.clientId } : {}),
       to: opts.to,
       from: opts.from,
       goal: opts.goal,
@@ -398,16 +567,15 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
   // the whole conversation server-side toward the given goal; poll the status
   // URL for the live transcript and final result.
   app.post('/orchestrations', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
     const parsed = orchestrationBodySchema.safeParse(req.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid body' });
     }
-    const from = await resolveFrom(parsed.data.from);
-    if (!from) {
-      return reply
-        .code(400)
-        .send({ error: 'no from number: register one via POST /numbers or set TWILIO_FROM_NUMBER' });
-    }
+    const from = await resolveFromFor(auth, parsed.data.from, reply);
+    if (!from) return;
+    if (!(await checkCallQuota(auth, reply))) return;
     const started = await startCall(parsed.data.to, from);
     if (!started.ok) {
       return reply.code(424).send({ error: started.error, callId: started.callId });
@@ -416,6 +584,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     const record = createOrchestrationRecord({
       id: started.callId,
       direction: 'outbound',
+      ...(auth.kind === 'client' ? { clientId: auth.client.id } : {}),
       to: parsed.data.to,
       from,
       goal: parsed.data.goal,
@@ -434,20 +603,28 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
   });
 
   app.get('/orchestrations/:id', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
     const { id } = req.params as { id: string };
     const record = orchestrations.get(id);
     if (!record) return reply.code(404).send({ error: 'no such orchestration' });
+    if (auth.kind === 'client' && record.clientId !== auth.client.id) {
+      return reply.code(404).send({ error: 'no such orchestration' });
+    }
     return record;
   });
 
   // Discovery surface: how a polling agent notices calls it did not place
   // (notably answered inbound calls). Newest first; summaries only.
   app.get('/orchestrations', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
     const parsed = orchestrationListQuerySchema.safeParse(req.query);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid query' });
     }
     const records = [...orchestrations.values()]
+      .filter((r) => auth.kind !== 'client' || r.clientId === auth.client.id)
       .filter((r) => !parsed.data.direction || r.direction === parsed.data.direction)
       .filter((r) => !parsed.data.status || r.status === parsed.data.status)
       .sort((a, b) => b.startedAt.localeCompare(a.startedAt))
@@ -456,6 +633,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
         id: r.id,
         direction: r.direction,
         startedAt: r.startedAt,
+        clientId: r.clientId,
         to: r.to,
         from: r.from,
         goal: r.goal,
@@ -467,20 +645,38 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     return { count: records.length, orchestrations: records };
   });
 
-  // Standing policy for answering incoming calls. Survives until restart;
-  // the INBOUND_GOAL env var provides the boot-time default.
+  // Standing policy for answering incoming calls. Client tokens read/write
+  // their own persisted persona (routed by which number was dialed); the
+  // global fallback covers unbound numbers, with INBOUND_GOAL as boot default.
   app.post('/inbound-config', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
     const parsed = inboundConfigBodySchema.safeParse(req.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid body' });
+    }
+    if (auth.kind === 'client') {
+      store.update(auth.client.id, { inbound: parsed.data });
+      return { inbound: parsed.data };
     }
     inboundConfig = parsed.data;
     return { inbound: inboundConfig };
   });
 
-  app.get('/inbound-config', async () => ({ inbound: inboundConfig }));
+  app.get('/inbound-config', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
+    if (auth.kind === 'client') return { inbound: auth.client.inbound ?? null };
+    return { inbound: inboundConfig };
+  });
 
-  app.delete('/inbound-config', async () => {
+  app.delete('/inbound-config', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
+    if (auth.kind === 'client') {
+      store.update(auth.client.id, { inbound: null });
+      return { inbound: null };
+    }
     inboundConfig = null;
     return { inbound: null };
   });
@@ -501,7 +697,13 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     }
 
     reply.type('text/xml');
-    if (!inboundConfig) return buildRejectTwiml();
+    // Route by the dialed number: a bound number answers with its client's
+    // persona (subject to that client's quota); unbound numbers use the
+    // global fallback policy.
+    const owner = params.To ? store.findByNumber(params.To) : undefined;
+    const policy = owner ? (owner.inbound ?? null) : inboundConfig;
+    if (!policy) return buildRejectTwiml();
+    if (owner && (await overCallQuota(owner))) return buildRejectTwiml();
 
     const callId = randomUUID();
     const session = new CallSession(callId, {
@@ -518,16 +720,128 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     const record = createOrchestrationRecord({
       id: callId,
       direction: 'inbound',
+      ...(owner ? { clientId: owner.id } : {}),
       to: params.To ?? ownedNumbers.at(-1)?.phoneNumber ?? 'unknown',
       from: params.From ?? 'unknown',
-      goal: inboundConfig.goal,
+      goal: policy.goal,
     });
     runOrchestrator(record, {
-      openingLine: inboundConfig.openingLine,
-      voice: inboundConfig.voice,
+      openingLine: policy.openingLine,
+      voice: policy.voice,
     });
 
     return buildStreamTwiml(`${wsBase()}/twilio/media/${callId}`);
+  });
+
+  // ---------- admin: client management ----------
+
+  // Mint a new client + API key. Admin only; the key is shown once here.
+  app.post('/clients', async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    const parsed = clientsBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid body' });
+    }
+    try {
+      const client = store.create(parsed.data.name, parsed.data.phoneNumber);
+      return reply.code(201).send(client);
+    } catch (error) {
+      return reply.code(409).send({ error: (error as Error).message });
+    }
+  });
+
+  app.get('/clients', async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    return store.list();
+  });
+
+  app.delete('/clients/:id', async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    const { id } = req.params as { id: string };
+    if (!store.remove(id)) return reply.code(404).send({ error: 'no such client' });
+    // The number (if any) stays owned by the Twilio account; release it
+    // separately via DELETE /numbers/:sid if it should stop billing.
+    return { removed: id };
+  });
+
+  // ---------- accounting ----------
+
+  // Charges from the provider's records (the billing source of truth),
+  // attributed to whichever client's number was involved. Admin sees all
+  // accounts plus unattributed traffic; a client token sees its own.
+  app.get('/accounting', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
+    const parsed = accountingQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid query' });
+    }
+    const days = parsed.data.days;
+    try {
+      const [calls, messages] = await Promise.all([
+        deps.twilioApi.listCalls({ sinceDays: days, limit: 1000 }),
+        deps.twilioApi.listSms({ sinceDays: days, limit: 500 }),
+      ]);
+
+      const attributedCallSids = new Set<string>();
+      const attributedSmsSids = new Set<string>();
+      const round = (v: number): number => Math.round(v * 10000) / 10000;
+
+      const summarize = (phoneNumber: string | undefined) => {
+        const myCalls = phoneNumber
+          ? calls.filter((c) => c.from === phoneNumber || c.to === phoneNumber)
+          : [];
+        const mySms = phoneNumber
+          ? messages.filter((m) => m.from === phoneNumber || m.to === phoneNumber)
+          : [];
+        for (const c of myCalls) attributedCallSids.add(c.sid);
+        for (const m of mySms) attributedSmsSids.add(m.sid);
+        const callSeconds = myCalls.reduce((sum, c) => sum + c.durationSeconds, 0);
+        const callCost = myCalls.reduce((sum, c) => sum + (c.priceUsd ?? 0), 0);
+        const smsCost = mySms.reduce((sum, m) => sum + (m.priceUsd ?? 0), 0);
+        const rental = phoneNumber ? NUMBER_MONTHLY_ESTIMATE_USD : 0;
+        return {
+          calls: { count: myCalls.length, minutes: round(callSeconds / 60), costUsd: round(callCost) },
+          sms: { count: mySms.length, costUsd: round(smsCost) },
+          numberMonthlyEstimateUsd: rental,
+          totalUsd: round(callCost + smsCost + rental),
+        };
+      };
+
+      const clients = (auth.kind === 'client' ? [auth.client] : store.list()).map((c) => ({
+        clientId: c.id,
+        name: c.name,
+        phoneNumber: c.phoneNumber ?? null,
+        limits: c.limits,
+        ...summarize(c.phoneNumber),
+      }));
+
+      if (auth.kind === 'client') {
+        return { days, currency: 'USD', account: clients[0] };
+      }
+
+      const leftoverCalls = calls.filter((c) => !attributedCallSids.has(c.sid));
+      const leftoverSms = messages.filter((m) => !attributedSmsSids.has(m.sid));
+      const unattributed = {
+        calls: {
+          count: leftoverCalls.length,
+          minutes: round(leftoverCalls.reduce((s, c) => s + c.durationSeconds, 0) / 60),
+          costUsd: round(leftoverCalls.reduce((s, c) => s + (c.priceUsd ?? 0), 0)),
+        },
+        sms: {
+          count: leftoverSms.length,
+          costUsd: round(leftoverSms.reduce((s, m) => s + (m.priceUsd ?? 0), 0)),
+        },
+      };
+      const totalUsd = round(
+        clients.reduce((s, c) => s + c.totalUsd, 0) +
+          unattributed.calls.costUsd +
+          unattributed.sms.costUsd,
+      );
+      return { days, currency: 'USD', clients, unattributed, totalUsd };
+    } catch (error) {
+      return reply.code(424).send({ error: `accounting failed: ${(error as Error).message}` });
+    }
   });
 
   app.get('/calls/:callId', async (req, reply) => {

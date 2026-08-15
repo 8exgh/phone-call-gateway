@@ -2,6 +2,7 @@ import twilio from 'twilio';
 import { buildStreamTwiml } from './twiml';
 import type {
   AvailableNumber,
+  CallRecord,
   CreateCallParams,
   CreatedCall,
   PurchasedNumber,
@@ -10,6 +11,13 @@ import type {
   SmsMessage,
   TwilioApi,
 } from './twilioApi';
+
+/** Twilio reports prices as negative decimal strings; normalize to +USD. */
+function parsePrice(price: string | null | undefined): number | null {
+  if (price === null || price === undefined) return null;
+  const value = Number.parseFloat(price);
+  return Number.isNaN(value) ? null : Math.abs(value);
+}
 
 export interface TwilioCredentials {
   accountSid: string;
@@ -100,6 +108,23 @@ export class LiveTwilioApi implements TwilioApi {
       body: m.body,
       status: m.status,
       sentAt: (m.dateSent ?? m.dateCreated).toISOString(),
+      priceUsd: parsePrice(m.price),
+    }));
+  }
+
+  async listCalls(opts: { sinceDays: number; limit?: number }): Promise<CallRecord[]> {
+    const calls = await this.client.calls.list({
+      startTimeAfter: new Date(Date.now() - opts.sinceDays * 24 * 60 * 60 * 1000),
+      limit: opts.limit ?? 500,
+    });
+    return calls.map((c) => ({
+      sid: c.sid,
+      direction: c.direction === 'inbound' ? 'inbound' : 'outbound',
+      from: c.from,
+      to: c.to,
+      durationSeconds: Number.parseInt(c.duration ?? '0', 10) || 0,
+      priceUsd: parsePrice(c.price),
+      startedAt: (c.startTime ?? c.dateCreated).toISOString(),
     }));
   }
 }

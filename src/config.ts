@@ -21,6 +21,14 @@ const envSchema = z.object({
   /** Standing goal for answering incoming calls; empty = reject incoming calls. */
   INBOUND_GOAL: z.string().optional(),
   INBOUND_OPENING_LINE: z.string().optional(),
+  /**
+   * Admin password. When set, all client endpoints require a bearer token
+   * (this admin key, or a per-client key minted via POST /clients).
+   * Unset = open single-tenant mode.
+   */
+  ADMIN_API_KEY: z.string().optional(),
+  /** Where durable state (client registry) lives; mount a volume here. */
+  DATA_DIR: z.string().default('./data'),
 });
 
 export interface AppConfig {
@@ -42,6 +50,8 @@ export interface AppConfig {
   transcribeSilenceMs: number;
   inboundGoal?: string;
   inboundOpeningLine?: string;
+  adminApiKey?: string;
+  dataDir: string;
   chatModel: string;
 }
 
@@ -89,6 +99,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     transcribeSilenceMs: parsed.TRANSCRIBE_SILENCE_MS,
     inboundGoal: parsed.INBOUND_GOAL,
     inboundOpeningLine: parsed.INBOUND_OPENING_LINE,
+    adminApiKey: parsed.ADMIN_API_KEY || undefined,
+    dataDir: parsed.DATA_DIR,
     chatModel: parsed.CHAT_MODEL,
   };
 }

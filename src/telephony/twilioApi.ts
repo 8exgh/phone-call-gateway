@@ -44,6 +44,19 @@ export interface SmsMessage {
   status: string;
   /** ISO timestamp of when the message was sent or received. */
   sentAt: string;
+  /** Provider charge in USD (positive), null when not yet rated. */
+  priceUsd: number | null;
+}
+
+export interface CallRecord {
+  sid: string;
+  direction: 'inbound' | 'outbound';
+  from: string;
+  to: string;
+  durationSeconds: number;
+  /** Provider charge in USD (positive), null when not yet rated. */
+  priceUsd: number | null;
+  startedAt: string;
 }
 
 export interface TwilioApi {
@@ -58,6 +71,11 @@ export interface TwilioApi {
   /** Point a number's incoming-call webhook at the given HTTPS URL. */
   configureVoiceWebhook(sid: string, voiceUrl: string): Promise<void>;
   sendSms(params: SendSmsParams): Promise<SentSms>;
+  /**
+   * Call history (both directions) from the last sinceDays days, newest
+   * first — the provider is the source of truth for usage and charges.
+   */
+  listCalls(opts: { sinceDays: number; limit?: number }): Promise<CallRecord[]>;
   /**
    * Messages (both directions) from the last sinceDays days, newest first.
    * Inbound messages appear here even with no SMS webhook configured, so

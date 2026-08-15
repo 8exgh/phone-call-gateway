@@ -61,6 +61,8 @@ async function main(): Promise<void> {
     twilioFromNumber: config.twilioFromNumber,
     inboundGoal: config.inboundGoal,
     inboundOpeningLine: config.inboundOpeningLine,
+    adminApiKey: config.adminApiKey,
+    dataDir: config.dataDir,
   });
   await app.listen({ port: config.port, host: '0.0.0.0' });
   console.log(`phone-call-gateway (${config.mode} mode) listening on port ${config.port}`);

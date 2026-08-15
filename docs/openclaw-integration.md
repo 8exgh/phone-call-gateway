@@ -16,10 +16,71 @@ That injects the phone workspace doc; the agent drives everything with curl.
 
 ## Authentication
 
-**There is currently no API key.** Twilio and OpenAI credentials live
-server-side; the caller of this API needs nothing but the URL. That also means
-anyone who discovers the hostname can place calls on the Twilio account — put
-a bearer token in front before handing the URL to anything semi-trusted.
+Every endpoint (except `/health` and Twilio's webhook) requires a bearer
+token:
+
+```bash
+curl -s "$PHONE_GATEWAY_URL/orchestrations" -H "Authorization: Bearer $PHONE_GATEWAY_API_KEY"
+```
+
+There are two kinds of token:
+
+- **Admin key** (`ADMIN_API_KEY` on the server) — the operator's password. It
+  can do everything, sees all accounts, and is the only key that can mint
+  client tokens:
+
+  ```bash
+  curl -s -X POST "$PHONE_GATEWAY_URL/clients" -H "Authorization: Bearer $ADMIN_KEY" \
+    -H 'content-type: application/json' -d '{"name": "jason"}'
+  # → 201 { "id": "jason-3f2a", "apiKey": "pgw_…", "limits": { "maxNumbers": 1, "maxCallHoursPerMonth": 90 } }
+  ```
+
+  `GET /clients` lists accounts; `DELETE /clients/:id` removes one (release
+  its number separately). Pass `"phoneNumber": "+1…"` on creation to pre-bind
+  an already-owned number.
+
+- **Client key** (`pgw_…`) — what each OpenClaw gets. It is scoped: one
+  registered number (calls and texts always send from it), its own inbound
+  answering persona, and visibility only into its own calls, SMS, and
+  charges. Limits per client: **1 phone number** and **90 call-hours per
+  month** (measured from the provider's call log, inbound + outbound; over
+  quota means outbound returns 429 and incoming calls are rejected).
+
+Every claw should set both env vars: `PHONE_GATEWAY_URL` and
+`PHONE_GATEWAY_API_KEY`, and send the Authorization header on every request
+shown in this document.
+
+## Registering a number (per client)
+
+A client registers its one number itself; area codes fall back to same-city
+overlays when dry (e.g. Winnipeg's 204 is usually out of stock, so the
+overlay 431 supplies the number — the response tells you which was used):
+
+```bash
+curl -s -X POST "$PHONE_GATEWAY_URL/numbers" \
+  -H "Authorization: Bearer $PHONE_GATEWAY_API_KEY" -H 'content-type: application/json' \
+  -d '{"areaCode": "204"}'
+# → { "sid": "PN…", "phoneNumber": "+1431…", "areaCode": "431" }
+```
+
+The number is remembered server-side: omit `from` everywhere after this.
+
+## Accounting
+
+Charges come from the provider's own records, attributed to whichever
+account's number was involved:
+
+```bash
+curl -s "$PHONE_GATEWAY_URL/accounting?days=30" -H "Authorization: Bearer $KEY"
+```
+
+With a client key you get your own account:
+`{ "days": 30, "currency": "USD", "account": { "clientId": …, "calls": { "count", "minutes", "costUsd" }, "sms": { … }, "numberMonthlyEstimateUsd": 1.15, "totalUsd": … } }`.
+With the admin key you get `clients: […]` (every account), plus
+`unattributed` traffic (calls/SMS involving no bound number) and a grand
+`totalUsd`. Note: number rental is a flat estimate (Twilio doesn't expose it
+per number), and very recent traffic can be briefly unrated (`costUsd`
+counts it as 0 until Twilio rates it).
 
 ## Make a call (the one-shot orchestration surface)
 
