@@ -78,6 +78,36 @@ export class FakeTwilioApi implements TwilioApi {
     this.clientsBySid.get(providerCallSid)?.endCall();
   }
 
+  /** sid -> configured incoming-call webhook URL. */
+  readonly voiceWebhooks = new Map<string, string>();
+
+  async configureVoiceWebhook(sid: string, voiceUrl: string): Promise<void> {
+    if (!this.purchasedNumbers.some((p) => p.sid === sid)) {
+      throw new Error(`no owned number with sid ${sid}`);
+    }
+    this.voiceWebhooks.set(sid, voiceUrl);
+  }
+
+  /**
+   * Test/mock helper: an outside caller dials in. Connects a fake media peer
+   * to the stream URL from the inbound webhook's TwiML and registers it so
+   * hangupCall works on it.
+   */
+  spawnInboundCaller(streamUrl: string, script?: CallerScript): FakeTwilioMediaClient {
+    const id = ++this.counter;
+    const providerCallSid = `CA-inbound-${id}`;
+    const client = new FakeTwilioMediaClient({
+      url: streamUrl,
+      providerCallSid,
+      streamSid: `MZ-inbound-${id}`,
+      script: script ?? this.opts.script ?? defaultCallerScript,
+      framePacingMs: this.opts.framePacingMs ?? 0,
+    });
+    this.mediaClients.push(client);
+    this.clientsBySid.set(providerCallSid, client);
+    return client;
+  }
+
   readonly smsMessages: SmsMessage[] = [];
 
   async sendSms(params: SendSmsParams): Promise<SentSms> {

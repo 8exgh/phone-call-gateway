@@ -26,6 +26,8 @@ export async function startGateway(
     script?: CallerScript;
     synthesizer?: SpeechSynthesizer;
     chatClientFactory?: () => ChatClient;
+    serverConfig?: Partial<Parameters<typeof buildServer>[1]>;
+    webhookValidator?: Parameters<typeof buildServer>[0]['webhookValidator'];
   } = {},
 ): Promise<Gateway> {
   const script = opts.script ?? defaultCallerScript;
@@ -36,8 +38,9 @@ export async function startGateway(
       synthesizer: opts.synthesizer ?? new FakeSpeechSynthesizer(),
       transcriberFactory: new FakeTranscriberFactory(script),
       chatClientFactory: opts.chatClientFactory ?? (() => new FakeChatClient(demoChatScript)),
+      webhookValidator: opts.webhookValidator,
     },
-    { ttsVoice: 'alloy' },
+    { ttsVoice: 'alloy', ...opts.serverConfig },
   );
   await app.listen({ port: 0, host: '127.0.0.1' });
   const port = (app.server.address() as AddressInfo).port;

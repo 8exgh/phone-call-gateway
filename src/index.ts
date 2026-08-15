@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import twilio from 'twilio';
 import { loadConfig, type AppConfig } from './config';
 import { buildServer, type ServerDeps } from './server';
 import { FakeTwilioApi } from './fakes/fakeTwilioApi';
@@ -29,6 +30,12 @@ export function buildDeps(config: AppConfig, opts: { framePacingMs?: number } = 
         config.transcribeSilenceMs,
       ),
       chatClientFactory: () => new OpenAiChatClient(config.openAiApiKey!, config.chatModel),
+      // Signature validation needs the account auth token; with API-key-only
+      // auth the webhook is accepted unverified.
+      webhookValidator: config.twilioAuthToken
+        ? ({ signature, url, params }) =>
+            twilio.validateRequest(config.twilioAuthToken!, signature ?? '', url, params)
+        : undefined,
     };
   }
   return {
@@ -52,6 +59,8 @@ async function main(): Promise<void> {
     publicWssUrl: config.publicWssUrl,
     ttsVoice: config.ttsVoice,
     twilioFromNumber: config.twilioFromNumber,
+    inboundGoal: config.inboundGoal,
+    inboundOpeningLine: config.inboundOpeningLine,
   });
   await app.listen({ port: config.port, host: '0.0.0.0' });
   console.log(`phone-call-gateway (${config.mode} mode) listening on port ${config.port}`);

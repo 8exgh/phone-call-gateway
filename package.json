@@ -16,6 +16,7 @@
     "orchestrate": "tsx src/bin/orchestrate.ts"
   },
   "dependencies": {
+    "@fastify/formbody": "^9.0.0",
     "@fastify/websocket": "^11.0.2",
     "dotenv": "^16.4.5",
     "fastify": "^5.2.1",

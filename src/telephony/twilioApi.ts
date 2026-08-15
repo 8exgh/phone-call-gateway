@@ -55,6 +55,8 @@ export interface TwilioApi {
   releaseNumber(sid: string): Promise<void>;
   createCall(params: CreateCallParams): Promise<CreatedCall>;
   hangupCall(providerCallSid: string): Promise<void>;
+  /** Point a number's incoming-call webhook at the given HTTPS URL. */
+  configureVoiceWebhook(sid: string, voiceUrl: string): Promise<void>;
   sendSms(params: SendSmsParams): Promise<SentSms>;
   /**
    * Messages (both directions) from the last sinceDays days, newest first.

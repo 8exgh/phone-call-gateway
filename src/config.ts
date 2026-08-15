@@ -18,6 +18,9 @@ const envSchema = z.object({
   /** STT endpointing: ms of silence before an utterance is considered done. */
   TRANSCRIBE_SILENCE_MS: z.coerce.number().int().min(150).max(2000).default(250),
   CHAT_MODEL: z.string().default('gpt-4o-mini'),
+  /** Standing goal for answering incoming calls; empty = reject incoming calls. */
+  INBOUND_GOAL: z.string().optional(),
+  INBOUND_OPENING_LINE: z.string().optional(),
 });
 
 export interface AppConfig {
@@ -37,6 +40,8 @@ export interface AppConfig {
   transcribeModel: string;
   transcribeLanguage: string;
   transcribeSilenceMs: number;
+  inboundGoal?: string;
+  inboundOpeningLine?: string;
   chatModel: string;
 }
 
@@ -82,6 +87,8 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     transcribeModel: parsed.TRANSCRIBE_MODEL,
     transcribeLanguage: parsed.TRANSCRIBE_LANGUAGE,
     transcribeSilenceMs: parsed.TRANSCRIBE_SILENCE_MS,
+    inboundGoal: parsed.INBOUND_GOAL,
+    inboundOpeningLine: parsed.INBOUND_OPENING_LINE,
     chatModel: parsed.CHAT_MODEL,
   };
 }

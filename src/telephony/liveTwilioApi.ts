@@ -74,6 +74,10 @@ export class LiveTwilioApi implements TwilioApi {
     await this.client.calls(providerCallSid).update({ status: 'completed' });
   }
 
+  async configureVoiceWebhook(sid: string, voiceUrl: string): Promise<void> {
+    await this.client.incomingPhoneNumbers(sid).update({ voiceUrl, voiceMethod: 'POST' });
+  }
+
   async sendSms(params: SendSmsParams): Promise<SentSms> {
     const message = await this.client.messages.create({
       to: params.to,

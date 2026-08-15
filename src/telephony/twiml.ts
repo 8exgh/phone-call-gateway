@@ -18,3 +18,8 @@ export function buildStreamTwiml(wssUrl: string): string {
     `<Response><Connect><Stream url="${escapeXmlAttribute(wssUrl)}" /></Connect></Response>`
   );
 }
+
+/** Decline an incoming call (used when no inbound answering policy is set). */
+export function buildRejectTwiml(): string {
+  return '<?xml version="1.0" encoding="UTF-8"?><Response><Reject /></Response>';
+}

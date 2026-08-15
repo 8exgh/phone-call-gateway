@@ -178,18 +178,45 @@ SMS yet — poll `GET /sms` when expecting a reply.
 
 ## Receiving calls (pickup)
 
-**Not supported yet — the gateway is outbound-only (v1).** Nothing answers if
-someone calls +15877417105. To support pickup, the gateway needs:
+The gateway answers incoming calls **on your behalf**: you register a standing
+answering persona once, the built-in voice agent handles each call live toward
+that goal, and you discover the answered calls (with full transcripts) by
+polling. You never need to react to a ring in real time.
 
-1. An HTTPS webhook route (e.g. `POST /twilio/voice`) that Twilio hits when a
-   call comes in, answering with `<Response><Connect><Stream url="wss://…"/>`
-   and creating a call session on the fly (the tunnel hostname already
-   provides valid HTTPS, so no new infrastructure).
-2. The number's Voice URL configured to that route (one Twilio API call).
-3. An answering policy: a standing goal/persona the built-in orchestrator uses
-   to answer (and an inbound orchestration record OpenClaw discovers by
-   polling), since OpenClaw is a poll-driven agent and can't react to a ring
-   in real time.
+Set (or update) the answering persona:
+
+```bash
+curl -s -X POST "$PHONE_GATEWAY_URL/inbound-config" -H 'content-type: application/json' \
+  -d '{
+    "goal": "You are Sean'\''s assistant answering his number. Find out who is calling and why, take a message with callback details, keep it brief and friendly.",
+    "openingLine": "Hi! You have reached Sean'\''s assistant. Who am I speaking with?"
+  }'
+curl -s "$PHONE_GATEWAY_URL/inbound-config"      # read current policy
+curl -s -X DELETE "$PHONE_GATEWAY_URL/inbound-config"  # stop answering (reject calls)
+```
+
+The runtime config survives until the gateway restarts; the `INBOUND_GOAL` /
+`INBOUND_OPENING_LINE` env vars provide the boot-time default. With neither
+set, incoming calls are rejected.
+
+Discover answered calls by polling the list (same shape as your own calls,
+tagged `direction: "inbound"`, `from` = the caller's number):
+
+```bash
+curl -s "$PHONE_GATEWAY_URL/orchestrations?direction=inbound"
+# → { "count": 1, "orchestrations": [ { "id": "…", "direction": "inbound",
+#      "startedAt": "…", "from": "+1587…", "to": "+15877417105",
+#      "status": "ended", "turnCount": 5, "statusUrl": "/orchestrations/…" } ] }
+```
+
+Then `GET /orchestrations/<id>` for the full transcript, exactly like an
+outbound call. Poll on your heartbeat and follow up on anything new (records
+are in-memory: history resets when the gateway restarts, so treat the list as
+"recent calls", not an archive).
+
+Plumbing notes: purchased numbers get their Voice URL pointed at
+`POST /twilio/voice` automatically; Twilio webhook signatures are validated
+when the gateway has `TWILIO_AUTH_TOKEN` configured.
 
 Rules for agents:
 
