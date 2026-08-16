@@ -53,6 +53,8 @@ export interface ServerConfig {
   dataDir?: string;
   /** How long month-usage lookups are cached (default 60s; 0 in tests). */
   quotaCacheTtlMs?: number;
+  /** How long the agent holds the line for a tool result (default 25s). */
+  toolTimeoutMs?: number;
 }
 
 const areaCodeSchema = z.string().regex(/^\d{3}$/, 'areaCode must be 3 digits');
@@ -80,13 +82,97 @@ const smsQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(500).default(100),
 });
 
+const toolDefSchema = z.object({
+  name: z.string().min(1).max(64).regex(/^[a-zA-Z0-9_-]+$/),
+  description: z.string().min(1).max(1000),
+  parameters: z.record(z.string(), z.unknown()).optional(),
+});
+
 const orchestrationBodySchema = z.object({
   to: z.string().min(3),
   from: z.string().optional(),
   goal: z.string().default('Have a short, friendly conversation, then wrap up politely.'),
   openingLine: z.string().optional(),
   voice: z.string().optional(),
+  /** Tools the voice agent may invoke mid-call; defaults to DEFAULT_TOOLS. */
+  tools: z.array(toolDefSchema).max(32).optional(),
 });
+
+const respondBodySchema = z.object({
+  requestId: z.string().min(1),
+  result: z.string().min(1).max(8000),
+});
+
+const str = (description: string): Record<string, unknown> => ({ type: 'string', description });
+const objectOf = (props: Record<string, unknown>, required: string[]): Record<string, unknown> => ({
+  type: 'object',
+  properties: props,
+  required,
+});
+
+/**
+ * Default mid-call toolset: what a full assistant (an OpenClaw) can typically
+ * fulfill. The gateway never executes these itself — it brokers the request
+ * to whoever placed the call (poll the record's pendingRequests, run the
+ * matching capability, POST the result back). Names are hints, not a rigid
+ * API: the fulfiller interprets them with whatever tools it actually has.
+ */
+const DEFAULT_TOOLS = [
+  {
+    name: 'check_calendar',
+    description:
+      "Look up the owner's calendar: availability on a date or range, or what is scheduled.",
+    parameters: objectOf({ query: str('What to look up, e.g. "free Thursday afternoon?"') }, ['query']),
+  },
+  {
+    name: 'search_email',
+    description: "Search the owner's email for a message, confirmation number, or thread.",
+    parameters: objectOf({ query: str('What to find, e.g. "booking confirmation from Aloft Hotel"') }, ['query']),
+  },
+  {
+    name: 'web_search',
+    description: 'Search the web for current facts: hours, prices, addresses, news, anything public.',
+    parameters: objectOf({ query: str('The search query') }, ['query']),
+  },
+  {
+    name: 'fetch_webpage',
+    description: 'Fetch and read a specific web page or URL.',
+    parameters: objectOf({ url: str('The URL to read') }, ['url']),
+  },
+  {
+    name: 'run_bash',
+    description:
+      "Run a shell command on the assistant's computer: math, data processing, file inspection, scripts, anything a terminal can do.",
+    parameters: objectOf({ command: str('The bash command to run') }, ['command']),
+  },
+  {
+    name: 'write_code',
+    description:
+      'Write and execute a program (any language) to compute, convert, generate, or analyze something.',
+    parameters: objectOf({ task: str('What the program should do') }, ['task']),
+  },
+  {
+    name: 'read_file',
+    description: "Read a document or file the owner has (notes, PDFs, spreadsheets).",
+    parameters: objectOf({ what: str('Which file or document, described naturally') }, ['what']),
+  },
+  {
+    name: 'lookup_contact',
+    description: "Look up a person in the owner's contacts: phone, email, address, context.",
+    parameters: objectOf({ name: str('Who to look up') }, ['name']),
+  },
+  {
+    name: 'save_note',
+    description: "Save a note, reminder, or task to the owner's records so nothing is lost.",
+    parameters: objectOf({ note: str('The note to save') }, ['note']),
+  },
+  {
+    name: 'ask_assistant',
+    description:
+      "Anything else: ask the owner's assistant directly — it has email, calendars, files, contacts, a browser, a phone, and a full computer, and can answer or act on almost anything.",
+    parameters: objectOf({ question: str('The question or request') }, ['question']),
+  },
+];
 
 const inboundConfigBodySchema = z.object({
   goal: z.string().min(1),
@@ -484,9 +570,12 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     goal: string;
   }): OrchestrationRecord => orchestrations.start(opts);
 
+  /** Live orchestrator instances, for feeding tool results into running calls. */
+  const runningOrchestrators = new Map<string, Orchestrator>();
+
   const runOrchestrator = (
     record: OrchestrationRecord,
-    opts: { openingLine?: string; voice?: string },
+    opts: { openingLine?: string; voice?: string; tools?: z.infer<typeof toolDefSchema>[] },
   ): void => {
     const startedAt = Date.now();
     const orchestrator = new Orchestrator({
@@ -496,8 +585,18 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
         record.direction === 'inbound'
           ? `You are ANSWERING an incoming call from ${record.from}. ${record.goal}`
           : `Your goal for this call: ${record.goal}`,
+      objective: record.goal,
       openingLine: opts.openingLine,
       voice: opts.voice,
+      tools: opts.tools ?? DEFAULT_TOOLS,
+      toolTimeoutMs: config.toolTimeoutMs,
+      onToolRequest: (request) =>
+        orchestrations.toolRequested(record.id, {
+          id: request.id,
+          name: request.name,
+          arguments: request.arguments,
+        }),
+      onToolTimeout: (requestIds) => orchestrations.followUpPromised(record.id, requestIds),
       turnTimeoutMs: 15_000,
       onEvent: (event) => {
         // The debug timeline stays in memory while the call runs and is
@@ -518,6 +617,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
         }
       },
     });
+    runningOrchestrators.set(record.id, orchestrator);
     void orchestrator
       .run()
       .then((result) => {
@@ -535,6 +635,9 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
           turns: [],
           timeline: record.events,
         });
+      })
+      .finally(() => {
+        runningOrchestrators.delete(record.id);
       });
   };
 
@@ -564,7 +667,11 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
       from,
       goal: parsed.data.goal,
     });
-    runOrchestrator(record, { openingLine: parsed.data.openingLine, voice: parsed.data.voice });
+    runOrchestrator(record, {
+      openingLine: parsed.data.openingLine,
+      voice: parsed.data.voice,
+      tools: parsed.data.tools,
+    });
 
     return reply.code(202).send({
       orchestrationId: record.id,
@@ -610,6 +717,8 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
         direction: r.direction,
         startedAt: r.startedAt,
         clientId: r.clientId,
+        followUpRequired: r.followUpRequired,
+        openRequests: r.pendingRequests.filter((q) => q.status !== 'answered').length,
         to: r.to,
         from: r.from,
         goal: r.goal,
@@ -834,6 +943,31 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     } catch (error) {
       return reply.code(424).send({ error: `accounting failed: ${(error as Error).message}` });
     }
+  });
+
+  // Fulfill a mid-call tool request: while the call is live the result is fed
+  // straight into the conversation; after the call it records the answer and
+  // clears the follow-up flag (the fulfiller then calls the person back).
+  app.post('/orchestrations/:id/respond', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
+    const { id } = req.params as { id: string };
+    const record = orchestrations.get(id);
+    if (!record || (auth.kind === 'client' && record.clientId !== auth.client.id)) {
+      return reply.code(404).send({ error: 'no such orchestration' });
+    }
+    const parsed = respondBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid body' });
+    }
+    const request = record.pendingRequests.find((r) => r.id === parsed.data.requestId);
+    if (!request) return reply.code(404).send({ error: 'no such tool request' });
+    if (request.status === 'answered') {
+      return reply.code(409).send({ error: 'request already answered' });
+    }
+    orchestrations.toolAnswered(id, request.id, parsed.data.result);
+    const live = runningOrchestrators.get(id)?.provideToolResult(request.id, parsed.data.result);
+    return { request, deliveredLive: live ?? false };
   });
 
   app.get('/calls/:callId', async (req, reply) => {

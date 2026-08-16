@@ -141,6 +141,10 @@ Poll every few seconds until `status` is `ended` or `failed`:
   once it ends. Caller turns carry prosody annotations
   (`volume: whisper|normal|loud|yell`, `pace: calm|slow|normal|fast`,
   `stuttering`) — use them when judging how the call went.
+- **Mid-call tools**: the voice agent can invoke tools during the call — see
+  the "Mid-call tools" section below. While one runs it holds the line
+  naturally; if the result can't arrive in time it promises an immediate
+  callback and hangs up.
 - **IVR menus / keypad (DTMF)**: the voice agent can both press keys and hear
   them. Write goals like "navigate the menu: press 2 for billing, then ask
   about the invoice" — the agent dials keys itself (they appear as
@@ -179,6 +183,51 @@ on the phone; sendDigits shares these events by id),
 (partials), `transcript` (final text + prosody), `dtmf`
 (`{"type":"dtmf","digit":"4","atMs":12340}` — the remote party pressed a key),
 `error`.
+
+## Mid-call tools (the agent asks, YOU fulfill)
+
+The gateway never executes tools itself — it brokers them to whoever placed
+the call. The voice model decides *implicitly* when it needs one (caller asks
+"is he busy Thursday?" → it invokes `check_calendar`), says a natural hold
+line, and the request appears on the orchestration record.
+
+**Your fulfillment loop — run this while every call you place is running:**
+poll the record's `statusUrl` every 2–3 seconds. When `pendingRequests`
+contains an entry with `status: "open"`, execute it with whatever capability
+you actually have (the tool names are hints, not a rigid API: `run_bash` =
+your shell, `check_calendar` = however you read the calendar, `ask_assistant`
+= you, answering with your full toolbox), then post the result:
+
+```bash
+curl -s -X POST "$PHONE_GATEWAY_URL/orchestrations/<id>/respond" \
+  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"requestId": "<request id>", "result": "Calendar says: free after 3pm."}'
+```
+
+The result is injected into the live conversation and the agent answers the
+caller. Be fast: the agent holds the line ~25 seconds, reassuring once.
+
+**Default toolset** (used when you don't pass your own): `check_calendar`,
+`search_email`, `web_search`, `fetch_webpage`, `run_bash`, `write_code`,
+`read_file`, `lookup_contact`, `save_note`, and the catch-all
+`ask_assistant`. Override per call with `"tools": [{name, description,
+parameters?}, …]` in the POST /orchestrations body to declare exactly what
+you can fulfill.
+
+**The callback contract.** If no result arrives in time, the agent tells the
+caller "I'm going to hang up, take care of it right now, and call you back
+immediately" and ends the call. The record then has `followUpRequired: true`
+(also visible in the GET /orchestrations list). Your duty on seeing it:
+
+1. Execute the tool(s) in `pendingRequests` with status `callback_promised`.
+2. POST each result to `/respond` (this records the answer and clears
+   `followUpRequired`).
+3. Immediately place a new call to the same person with the answer, e.g.
+   goal: "You promised to call back with X — deliver it: <the answer>".
+
+Inbound-call caveat: tool brokering assumes someone is polling; for calls the
+gateway answers on its own, the persona should take messages rather than
+attempt live lookups, and you handle them on your next heartbeat.
 
 ## Phone numbers
 
