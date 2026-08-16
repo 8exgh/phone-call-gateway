@@ -245,9 +245,14 @@ export class Orchestrator {
         break;
       }
       case 'speech.started':
+        // Energy alone is NOT a barge-in trigger: on noisy lines the VAD
+        // fires continuously and would mute the agent completely (observed
+        // in the field). Words are the trigger — see transcript.delta.
         this.disarmSilenceTimer();
-        // Barge-in: the caller is talking over us; stop our audio and mark
-        // any reply still streaming from the LLM as superseded.
+        break;
+      case 'transcript.delta':
+        // Barge-in: the STT recognizes actual words while we are speaking —
+        // stop our audio and mark any still-streaming reply as superseded.
         if (this.saysInFlight.size > 0) {
           this.bargeInGeneration++;
           this.send({ type: 'clear' });
