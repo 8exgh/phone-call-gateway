@@ -24,7 +24,7 @@ async function req(
 }
 
 /** A webhook receiver that records payloads (and can be told to hang forever). */
-function receiver(hang = false): Promise<{
+function receiver(hang = false, statuses: number[] = []): Promise<{
   url: string;
   events: Record<string, unknown>[];
   headers: Record<string, string | string[] | undefined>[];
@@ -38,7 +38,10 @@ function receiver(hang = false): Promise<{
     request.on('end', () => {
       events.push(JSON.parse(body) as Record<string, unknown>);
       headers.push(request.headers);
-      if (!hang) response.end('ok'); // hanging receiver records but never responds
+      if (!hang) {
+        response.statusCode = statuses.shift() ?? 200;
+        response.end('ok');
+      } // hanging receiver records but never responds
     });
   });
   return new Promise((resolve) => {
@@ -122,6 +125,9 @@ describe('webhook notifications (multi-client isolation)', () => {
     await until(() => hookA.events.some((e) => e.event === 'tool.requested'));
     const ping = hookA.events.find((e) => e.event === 'tool.requested')!;
     expect(ping).toMatchObject({ orchestrationId: id, name: 'check_calendar' });
+    expect(ping.notificationId).toBe(`tool.requested:${id}:${String(ping.requestId)}`);
+    expect(ping.idempotencyKey).toBe(ping.notificationId);
+    expect(hookA.headers[0]!['idempotency-key']).toBe(ping.notificationId);
     expect(hookA.headers[0]!['x-openclaw-token']).toBe('claw-secret');
     expect(hookB.events.filter((e) => e.event === 'tool.requested')).toHaveLength(0);
 
@@ -184,6 +190,39 @@ describe('webhook notifications (multi-client isolation)', () => {
     await until(() => hook.events.some((e) => e.event === 'call.ended'));
     const ended = hook.events.find((e) => e.event === 'call.ended')!;
     expect(ended).toMatchObject({ followUpRequired: true });
+  });
+
+  it('retries a non-2xx notification with the same idempotency key', async () => {
+    const hook = await receiver(false, [503, 200]);
+    receivers.push(hook);
+    gw = await startGateway({
+      script: [
+        { pauseMs: 300 },
+        { waitForSayCompleted: true },
+        { speak: { text: 'check tomorrow', durationMs: 1200 } },
+        { pauseMs: 3000 },
+      ],
+      chatClientFactory: () =>
+        new FakeChatClient([
+          { reply: '', toolCalls: [{ name: 'check_calendar', arguments: '{"query":"tomorrow"}' }] },
+        ]),
+      serverConfig: {
+        adminApiKey: ADMIN,
+        dataDir: mkdtempSync(path.join(tmpdir(), 'pgw-notify-')),
+        notifyTimeoutMs: 300,
+        allowPrivateNotifyTargets: true,
+      },
+    });
+    const c = (await req(`${gw.baseUrl}/clients`, { token: ADMIN, body: { name: 'retry' } }))
+      .json as unknown as { apiKey: string };
+    await req(`${gw.baseUrl}/numbers`, { token: c.apiKey, body: { areaCode: '431' } });
+    await req(`${gw.baseUrl}/notify-config`, { token: c.apiKey, body: { url: hook.url } });
+    await req(`${gw.baseUrl}/orchestrations`, {
+      token: c.apiKey,
+      body: { to: '+15550001111', goal: 'quick call', openingLine: 'Hello!' },
+    });
+    await until(() => hook.events.length === 2);
+    expect(hook.headers[0]!['idempotency-key']).toBe(hook.headers[1]!['idempotency-key']);
   });
 
   it('rejects private notify targets unless explicitly allowed', async () => {

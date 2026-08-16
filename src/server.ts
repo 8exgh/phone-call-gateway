@@ -607,13 +607,25 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     const client = store.get(clientId);
     const url = client?.notifyUrl;
     if (!url) return;
-    const attempt = (): Promise<void> =>
-      fetch(url, {
+    const notificationId = [
+      String(payload.event ?? 'phone'),
+      String(payload.orchestrationId ?? 'unknown'),
+      String(payload.requestId ?? (payload.requestIds as string[] | undefined)?.join(',') ?? ''),
+    ].join(':');
+    const body = JSON.stringify({ ...payload, notificationId, idempotencyKey: notificationId });
+    const attempt = async (): Promise<void> => {
+      const response = await fetch(url, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', ...(client?.notifyHeaders ?? {}) },
-        body: JSON.stringify(payload),
+        headers: {
+          'content-type': 'application/json',
+          'idempotency-key': notificationId,
+          ...(client?.notifyHeaders ?? {}),
+        },
+        body,
         signal: AbortSignal.timeout(config.notifyTimeoutMs ?? 5000),
-      }).then(() => undefined);
+      });
+      if (!response.ok) throw new Error(`notify endpoint returned HTTP ${response.status}`);
+    };
     void attempt().catch(() =>
       new Promise((r) => setTimeout(r, 2000)).then(attempt).catch(() => undefined),
     );
