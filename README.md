@@ -24,7 +24,7 @@ credentials, faster than realtime. Real Twilio/OpenAI slot in with `MODE=live`.
 
 ```bash
 npm install
-npm test                    # 88 tests, all offline
+npm test                    # 154 tests, all offline
 npm run orchestrate -- --fast   # watch an LLM-orchestrated demo call end to end
 ```
 
@@ -43,13 +43,47 @@ Caller [volume: whisper, pace: normal]: okay... fine. that sounds reasonable.
 ## Architecture
 
 ```
-                 ┌───────────────────────────── gateway ─────────────────────────────┐
- orchestrator    │  control WS         CallSession            media WS               │   Twilio
- (LLM loop) ◄────┼─ transcripts ◄─ ProsodyAnalyzer ◄─ mu-law decode ◄─ media events ◄┼── caller
-            ─────┼─ say {text} ─► TTS 24k PCM ─► 8k mu-law frames ─► media events ───┼─► audio
-                 │                    │                                              │
-                 │            OpenAI TTS / realtime STT (live) or fakes (mock)       │
-                 └───────────────────────────────────────────────────────────────────┘
+┌────────────────────────────── clients ───────────────────────────────┐
+│  OpenClaw agents — one bearer token + one phone number + 90h/month   │
+│  each · admin key mints tokens, sees accounting + the raw event log  │
+└──────┬───────────────────────────────────────▲───────────────────────┘
+       │ REST: /orchestrations /calls /sms     │ webhook push (per
+       │ /numbers /inbound-config /accounting  │ client, isolated):
+       │ /notify-config (+ /clients /events)   │  tool.requested
+       │ control WS per call:                  │  followup.promised
+       │  say / sendDigits / clear / hangup    │  call.inbound.started
+       ▼                                       │  call.ended
+┌─── Cloudflare tunnel: phone-gateway.fusenv.com → Server7:3052 ───────┐
+│                                                                      │
+│  auth · per-client scoping · 90h/month quotas · charge attribution   │
+│                                                                      │
+│  Orchestrator (one per call) — goal-locked LLM loop                  │
+│    transcripts + prosody in → sentence-streamed says out             │
+│    barge-in on recognized words · PRESS(digits) for IVR menus        │
+│    mid-call tools: hold the line → broker to the client's agent →    │
+│    speak the answer — or promise an immediate callback and hang up   │
+│         │ control WS (loopback)                                      │
+│         ▼                                                            │
+│  CallSession (per-call state machine)                                │
+│    out: say queue → TTS 24k PCM → FIR ↓8k → μ-law → 20ms frames      │
+│         → 200ms prebuffer → marks (real playback acks) · DTMF tones  │
+│    in:  μ-law decode → echo gate (Geigel double-talk detector)       │
+│           ├→ prosody DSP: VAD · pace · volume · stutter              │
+│           └→ FIR ↑24k → realtime STT (English-pinned)                │
+│                                                                      │
+│  Event store — CQRS+ES: append-only SQLite events.db (/data volume)  │
+│    commands append client.* / orchestration.* events; projections    │
+│    (clients, numbers, personas, call history) replay at boot         │
+└──────┬───────────────────────────────────────┬───────────────────────┘
+       │ Twilio REST + bidirectional media WS  │ OpenAI HTTPS + WSS
+       ▼                                       ▼
+   Twilio                                   OpenAI
+     outbound calls · inbound webhook →       gpt-4o-mini-tts (voice out)
+     <Connect><Stream> · SMS both ways        realtime transcription (ears)
+     per-number routing · call/price log      chat + tool calling (brain)
+       │
+       ▼
+   PSTN — the actual phones on both ends
 ```
 
 - REST — numbers: `GET /numbers/available?areaCode=415` (preview candidates),
