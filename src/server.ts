@@ -644,6 +644,10 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
         });
         notifyClient(record.clientId, {
           event: 'tool.requested',
+          message:
+            `URGENT phone gateway: a LIVE call is holding the line for tool ${request.name}(${request.arguments}). ` +
+            `Execute it with your real capabilities RIGHT NOW (within ~20 seconds), then POST {"requestId": "${request.id}", "result": "<what you found>"} ` +
+            `to $PHONE_GATEWAY_URL/orchestrations/${record.id}/respond with your PHONE_GATEWAY_API_KEY bearer token. See capabilities/phone.md.`,
           orchestrationId: record.id,
           requestId: request.id,
           name: request.name,
@@ -656,6 +660,10 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
         orchestrations.followUpPromised(record.id, requestIds);
         notifyClient(record.clientId, {
           event: 'followup.promised',
+          message:
+            `Phone gateway: the call with ${record.direction === 'inbound' ? record.from : record.to} just ended with a PROMISED CALLBACK. ` +
+            `GET $PHONE_GATEWAY_URL/orchestrations/${record.id} for the pending tool requests, execute them with your real capabilities, ` +
+            `POST each result to /orchestrations/${record.id}/respond, then IMMEDIATELY place a call back to the person delivering the answer. A promise was made in your name.`,
           orchestrationId: record.id,
           requestIds,
           to: record.to,
@@ -696,6 +704,11 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
         if (record.direction === 'inbound' || record.followUpRequired) {
           notifyClient(record.clientId, {
             event: 'call.ended',
+            message:
+              `Phone gateway: the ${record.direction} call with ${record.direction === 'inbound' ? record.from : record.to} ended (${record.status}${record.reason ? `: ${record.reason}` : ''}). ` +
+              (record.followUpRequired
+                ? 'A CALLBACK IS OWED: fetch the record, execute the pending requests, respond, and call them back now.'
+                : `Review the transcript at $PHONE_GATEWAY_URL/orchestrations/${record.id} and act on any message taken.`),
             orchestrationId: record.id,
             direction: record.direction,
             from: record.from,
@@ -891,6 +904,9 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     });
     notifyClient(owner?.id, {
       event: 'call.inbound.started',
+      message:
+        `Phone gateway: incoming call from ${record.from} is being answered on your number right now. ` +
+        `Watch $PHONE_GATEWAY_URL/orchestrations/${record.id} every few seconds until it ends and fulfill any open tool request immediately (see capabilities/phone.md).`,
       orchestrationId: record.id,
       from: record.from,
       to: record.to,
