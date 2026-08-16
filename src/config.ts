@@ -15,8 +15,11 @@ const envSchema = z.object({
   TRANSCRIBE_MODEL: z.string().default('gpt-4o-mini-transcribe'),
   /** ISO-639-1 hint for STT; empty string = auto-detect. */
   TRANSCRIBE_LANGUAGE: z.string().default('en'),
-  /** STT endpointing: ms of silence before an utterance is considered done. */
-  TRANSCRIBE_SILENCE_MS: z.coerce.number().int().min(150).max(2000).default(250),
+  /**
+   * STT endpointing: ms of silence before an utterance is considered done.
+   * 250 proved too eager for thoughtful speakers (mid-sentence cutoffs).
+   */
+  TRANSCRIBE_SILENCE_MS: z.coerce.number().int().min(150).max(2000).default(450),
   CHAT_MODEL: z.string().default('gpt-4o-mini'),
   /** Standing goal for answering incoming calls; empty = reject incoming calls. */
   INBOUND_GOAL: z.string().optional(),

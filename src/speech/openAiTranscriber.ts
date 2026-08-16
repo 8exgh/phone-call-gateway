@@ -52,9 +52,14 @@ class OpenAiTranscriberSession implements TranscriberSession {
                 format: { type: 'audio/pcm', rate: 24000 },
                 transcription: {
                   model: this.model,
-                  // A language hint stops the model language-hopping on
-                  // noisy phone-band audio.
-                  ...(this.language ? { language: this.language } : {}),
+                  // The language field alone is a weak hint the model drops
+                  // on noisy fragments; the prompt reinforces it strongly.
+                  ...(this.language
+                    ? {
+                        language: this.language,
+                        prompt: `The speaker is on a phone call in language "${this.language}". Transcribe only in that language; never switch languages.`,
+                      }
+                    : {}),
                 },
                 noise_reduction: { type: 'near_field' },
                 turn_detection: { type: 'server_vad', silence_duration_ms: this.silenceMs },
