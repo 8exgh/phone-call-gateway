@@ -109,6 +109,8 @@ const respondBodySchema = z.object({
 
 const notifyConfigBodySchema = z.object({
   url: z.string().url().max(500),
+  /** Extra headers sent with every ping (e.g. the receiver's bearer token). */
+  headers: z.record(z.string().max(64), z.string().max(500)).optional(),
 });
 
 /** Refuse notify targets that would point the gateway at its own network. */
@@ -602,12 +604,13 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
    */
   const notifyClient = (clientId: string | undefined, payload: Record<string, unknown>): void => {
     if (!clientId) return;
-    const url = store.get(clientId)?.notifyUrl;
+    const client = store.get(clientId);
+    const url = client?.notifyUrl;
     if (!url) return;
     const attempt = (): Promise<void> =>
       fetch(url, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', ...(client?.notifyHeaders ?? {}) },
         body: JSON.stringify(payload),
         signal: AbortSignal.timeout(config.notifyTimeoutMs ?? 5000),
       }).then(() => undefined);
@@ -916,8 +919,11 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     if (!config.allowPrivateNotifyTargets && isForbiddenNotifyTarget(parsed.data.url)) {
       return reply.code(400).send({ error: 'notify url must be a public http(s) endpoint' });
     }
-    store.update(auth.client.id, { notifyUrl: parsed.data.url });
-    return { notifyUrl: parsed.data.url };
+    store.update(auth.client.id, {
+      notifyUrl: parsed.data.url,
+      notifyHeaders: parsed.data.headers,
+    });
+    return { notifyUrl: parsed.data.url, headers: Object.keys(parsed.data.headers ?? {}) };
   });
 
   app.get('/notify-config', async (req, reply) => {
@@ -935,7 +941,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     if (auth.kind !== 'client') {
       return reply.code(400).send({ error: 'notify-config is per-client: use a client token' });
     }
-    store.update(auth.client.id, { notifyUrl: undefined });
+    store.update(auth.client.id, { notifyUrl: undefined, notifyHeaders: undefined });
     return { notifyUrl: null };
   });
 

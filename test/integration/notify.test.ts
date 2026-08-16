@@ -24,20 +24,27 @@ async function req(
 }
 
 /** A webhook receiver that records payloads (and can be told to hang forever). */
-function receiver(hang = false): Promise<{ url: string; events: Record<string, unknown>[]; close: () => void }> {
+function receiver(hang = false): Promise<{
+  url: string;
+  events: Record<string, unknown>[];
+  headers: Record<string, string | string[] | undefined>[];
+  close: () => void;
+}> {
   const events: Record<string, unknown>[] = [];
+  const headers: Record<string, string | string[] | undefined>[] = [];
   const server: Server = createServer((request, response) => {
     let body = '';
     request.on('data', (chunk: Buffer) => (body += chunk.toString()));
     request.on('end', () => {
       events.push(JSON.parse(body) as Record<string, unknown>);
+      headers.push(request.headers);
       if (!hang) response.end('ok'); // hanging receiver records but never responds
     });
   });
   return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', () => {
       const port = (server.address() as AddressInfo).port;
-      resolve({ url: `http://127.0.0.1:${port}/hook`, events, close: () => server.close() });
+      resolve({ url: `http://127.0.0.1:${port}/hook`, events, headers, close: () => server.close() });
     });
   });
 }
@@ -94,7 +101,14 @@ describe('webhook notifications (multi-client isolation)', () => {
       .json as unknown as { id: string; apiKey: string };
     await req(`${gw.baseUrl}/numbers`, { token: a.apiKey, body: { areaCode: '431' } });
     await req(`${gw.baseUrl}/numbers`, { token: b.apiKey, body: { areaCode: '587' } });
-    expect((await req(`${gw.baseUrl}/notify-config`, { token: a.apiKey, body: { url: hookA.url } })).status).toBe(200);
+    expect(
+      (
+        await req(`${gw.baseUrl}/notify-config`, {
+          token: a.apiKey,
+          body: { url: hookA.url, headers: { 'x-openclaw-token': 'claw-secret' } },
+        })
+      ).status,
+    ).toBe(200);
     expect((await req(`${gw.baseUrl}/notify-config`, { token: b.apiKey, body: { url: hookB.url } })).status).toBe(200);
 
     // Client A places a call whose agent requests a tool.
@@ -108,6 +122,7 @@ describe('webhook notifications (multi-client isolation)', () => {
     await until(() => hookA.events.some((e) => e.event === 'tool.requested'));
     const ping = hookA.events.find((e) => e.event === 'tool.requested')!;
     expect(ping).toMatchObject({ orchestrationId: id, name: 'check_calendar' });
+    expect(hookA.headers[0]!['x-openclaw-token']).toBe('claw-secret');
     expect(hookB.events.filter((e) => e.event === 'tool.requested')).toHaveLength(0);
 
     // Fulfill via the ping's respondUrl and let the call finish normally.
