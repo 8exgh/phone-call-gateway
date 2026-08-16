@@ -55,6 +55,10 @@ export interface ServerConfig {
   quotaCacheTtlMs?: number;
   /** How long the agent holds the line for a tool result (default 25s). */
   toolTimeoutMs?: number;
+  /** Timeout per webhook notification attempt (default 5s). */
+  notifyTimeoutMs?: number;
+  /** Tests only: allow loopback/private notify targets. */
+  allowPrivateNotifyTargets?: boolean;
 }
 
 const areaCodeSchema = z.string().regex(/^\d{3}$/, 'areaCode must be 3 digits');
@@ -102,6 +106,23 @@ const respondBodySchema = z.object({
   requestId: z.string().min(1),
   result: z.string().min(1).max(8000),
 });
+
+const notifyConfigBodySchema = z.object({
+  url: z.string().url().max(500),
+});
+
+/** Refuse notify targets that would point the gateway at its own network. */
+function isForbiddenNotifyTarget(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '0.0.0.0') {
+      return true;
+    }
+    return /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.)/.test(host);
+  } catch {
+    return true;
+  }
+}
 
 const str = (description: string): Record<string, unknown> => ({ type: 'string', description });
 const objectOf = (props: Record<string, unknown>, required: string[]): Record<string, unknown> => ({
@@ -573,6 +594,28 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
   /** Live orchestrator instances, for feeding tool results into running calls. */
   const runningOrchestrators = new Map<string, Orchestrator>();
 
+  /**
+   * Fire-and-forget webhook ping to one client. Fully isolated: runs off the
+   * call path, per-client URL, independent fetch with its own timeout, one
+   * quiet retry, errors swallowed — a dead or slow endpoint for one client
+   * can never affect another client's calls (polling remains the fallback).
+   */
+  const notifyClient = (clientId: string | undefined, payload: Record<string, unknown>): void => {
+    if (!clientId) return;
+    const url = store.get(clientId)?.notifyUrl;
+    if (!url) return;
+    const attempt = (): Promise<void> =>
+      fetch(url, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(config.notifyTimeoutMs ?? 5000),
+      }).then(() => undefined);
+    void attempt().catch(() =>
+      new Promise((r) => setTimeout(r, 2000)).then(attempt).catch(() => undefined),
+    );
+  };
+
   const runOrchestrator = (
     record: OrchestrationRecord,
     opts: { openingLine?: string; voice?: string; tools?: z.infer<typeof toolDefSchema>[] },
@@ -590,13 +633,33 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
       voice: opts.voice,
       tools: opts.tools ?? DEFAULT_TOOLS,
       toolTimeoutMs: config.toolTimeoutMs,
-      onToolRequest: (request) =>
+      onToolRequest: (request) => {
         orchestrations.toolRequested(record.id, {
           id: request.id,
           name: request.name,
           arguments: request.arguments,
-        }),
-      onToolTimeout: (requestIds) => orchestrations.followUpPromised(record.id, requestIds),
+        });
+        notifyClient(record.clientId, {
+          event: 'tool.requested',
+          orchestrationId: record.id,
+          requestId: request.id,
+          name: request.name,
+          arguments: request.arguments,
+          respondUrl: `/orchestrations/${record.id}/respond`,
+          statusUrl: `/orchestrations/${record.id}`,
+        });
+      },
+      onToolTimeout: (requestIds) => {
+        orchestrations.followUpPromised(record.id, requestIds);
+        notifyClient(record.clientId, {
+          event: 'followup.promised',
+          orchestrationId: record.id,
+          requestIds,
+          to: record.to,
+          from: record.from,
+          statusUrl: `/orchestrations/${record.id}`,
+        });
+      },
       turnTimeoutMs: 15_000,
       onEvent: (event) => {
         // The debug timeline stays in memory while the call runs and is
@@ -627,6 +690,19 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
           turns: result.turns,
           timeline: record.events,
         });
+        if (record.direction === 'inbound' || record.followUpRequired) {
+          notifyClient(record.clientId, {
+            event: 'call.ended',
+            orchestrationId: record.id,
+            direction: record.direction,
+            from: record.from,
+            to: record.to,
+            status: record.status,
+            reason: record.reason,
+            followUpRequired: record.followUpRequired,
+            statusUrl: `/orchestrations/${record.id}`,
+          });
+        }
       })
       .catch((error: Error) => {
         orchestrations.finish(record.id, {
@@ -810,12 +886,57 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
       from: params.From ?? 'unknown',
       goal: policy.goal,
     });
+    notifyClient(owner?.id, {
+      event: 'call.inbound.started',
+      orchestrationId: record.id,
+      from: record.from,
+      to: record.to,
+      statusUrl: `/orchestrations/${record.id}`,
+    });
     runOrchestrator(record, {
       openingLine: policy.openingLine,
       voice: policy.voice,
     });
 
     return buildStreamTwiml(`${wsBase()}/twilio/media/${callId}`);
+  });
+
+  // Where the gateway pings this client when their calls need attention
+  // (tool.requested / followup.promised / call.inbound.started / call.ended).
+  app.post('/notify-config', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
+    if (auth.kind !== 'client') {
+      return reply.code(400).send({ error: 'notify-config is per-client: use a client token' });
+    }
+    const parsed = notifyConfigBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid body' });
+    }
+    if (!config.allowPrivateNotifyTargets && isForbiddenNotifyTarget(parsed.data.url)) {
+      return reply.code(400).send({ error: 'notify url must be a public http(s) endpoint' });
+    }
+    store.update(auth.client.id, { notifyUrl: parsed.data.url });
+    return { notifyUrl: parsed.data.url };
+  });
+
+  app.get('/notify-config', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
+    if (auth.kind !== 'client') {
+      return reply.code(400).send({ error: 'notify-config is per-client: use a client token' });
+    }
+    return { notifyUrl: auth.client.notifyUrl ?? null };
+  });
+
+  app.delete('/notify-config', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
+    if (auth.kind !== 'client') {
+      return reply.code(400).send({ error: 'notify-config is per-client: use a client token' });
+    }
+    store.update(auth.client.id, { notifyUrl: undefined });
+    return { notifyUrl: null };
   });
 
   // ---------- admin: client management ----------

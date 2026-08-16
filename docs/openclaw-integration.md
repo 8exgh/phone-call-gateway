@@ -214,6 +214,22 @@ caller. Be fast: the agent holds the line ~25 seconds, reassuring once.
 parameters?}, …]` in the POST /orchestrations body to declare exactly what
 you can fulfill.
 
+**Push instead of poll (optional).** Register a webhook and the gateway pings
+you the moment your calls need attention — no polling latency:
+
+```bash
+curl -s -X POST "$PHONE_GATEWAY_URL/notify-config" \
+  -H "Authorization: Bearer $KEY" -H 'content-type: application/json' \
+  -d '{"url": "https://your-endpoint.example.com/hooks/phone"}'
+```
+
+Events posted as JSON: `tool.requested` (agent is holding the line — act
+NOW; includes `requestId` and `respondUrl`), `followup.promised` (callback
+owed), `call.inbound.started`, and `call.ended` (inbound or follow-up calls).
+Delivery is per-client and isolated — your endpoint being down never affects
+anyone else's calls (and polling still works as the fallback). The URL must
+be public http(s). `GET`/`DELETE /notify-config` read/clear it.
+
 **The callback contract.** If no result arrives in time, the agent tells the
 caller "I'm going to hang up, take care of it right now, and call you back
 immediately" and ends the call. The record then has `followUpRequired: true`

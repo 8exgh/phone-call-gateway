@@ -29,6 +29,8 @@ export interface ClientRecord {
   phoneNumber?: string;
   numberSid?: string;
   inbound?: InboundPolicy | null;
+  /** Webhook the gateway pings when this client's calls need attention. */
+  notifyUrl?: string;
   limits: ClientLimits;
 }
 
@@ -79,7 +81,7 @@ export class ClientStore {
         const record = this.clients.get(id);
         if (!record) return;
         for (const [key, value] of Object.entries(patch)) {
-          if (value === null && (key === 'phoneNumber' || key === 'numberSid')) {
+          if (value === null && (key === 'phoneNumber' || key === 'numberSid' || key === 'notifyUrl')) {
             delete (record as unknown as Record<string, unknown>)[key];
           } else {
             (record as unknown as Record<string, unknown>)[key] = value;
