@@ -230,14 +230,25 @@ Delivery is per-client and isolated — your endpoint being down never affects
 anyone else's calls (and polling still works as the fallback). The URL must
 be public http(s). `GET`/`DELETE /notify-config` read/clear it.
 
+Every ping carries a stable `notificationId` (also sent as the
+`idempotency-key` header); retries and re-sends reuse it, so dedupe on it.
+Each delivery attempt is recorded on the orchestration record as
+`notifications[]` (`event`, `attempt`, `ok`, HTTP `status` or the fetch
+`error`, e.g. `ECONNREFUSED`) — check it when you suspect a ping never
+arrived. A `followup.promised` ping nobody accepted (record shows
+`followUpRequired: true, followUpDelivered: false`) is re-sent every 5
+minutes for 72 hours, flagged `redelivery: true`, until your endpoint
+answers 2xx; `POST /orchestrations/<id>/notify` re-sends it immediately and
+returns the attempt's outcome.
+
 **The callback contract.** If no result arrives in time, the agent tells the
 caller "I'm going to hang up, take care of it right now, and call you back
 immediately" and ends the call. The record then has `followUpRequired: true`
 (also visible in the GET /orchestrations list). Your duty on seeing it:
 
 1. Execute the tool(s) in `pendingRequests` with status `callback_promised`.
-2. POST each result to `/respond` (this records the answer and clears
-   `followUpRequired`).
+2. POST each result to `/respond` (this records the answer, clears
+   `followUpRequired`, and stops the re-sends).
 3. Immediately place a new call to the same person with the answer, e.g.
    goal: "You promised to call back with X — deliver it: <the answer>".
 

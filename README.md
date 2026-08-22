@@ -105,6 +105,15 @@ Caller [volume: whisper, pace: normal]: okay... fine. that sounds reasonable.
     -d '{"to":"+15551234567","goal":"Book a table for 2 at 7pm Friday under Ana"}'
   # → {"orchestrationId":"...","statusUrl":"/orchestrations/..."}
   ```
+- REST — webhook push + owed callbacks: `POST /notify-config {url, headers?}` registers a
+  per-client endpoint the gateway pings (`tool.requested`, `followup.promised`,
+  `call.inbound.started`, `call.ended`). Every delivery attempt is recorded on the
+  orchestration (`notifications[]`: attempt, HTTP status or fetch error such as
+  `ECONNREFUSED`), so a ping that reached nobody is visible in `GET /orchestrations/:id`.
+  A promised callback whose ping was never accepted (`followUpRequired: true`,
+  `followUpDelivered: false`) is re-pinged every 5 minutes for 72 hours until the endpoint
+  answers 2xx — same `notificationId`, so receivers dedupe. `POST /orchestrations/:id/notify`
+  re-sends it on demand and returns the outcome.
 - Twilio reaches `/twilio/media/:callId` via bidirectional Media Streams
   (`<Connect><Stream>`); the orchestrator connects to `/control/:callId`.
 - **Media clock**: all prosody timestamps are Twilio frame count × 20ms — never wall

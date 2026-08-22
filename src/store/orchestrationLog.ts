@@ -19,6 +19,22 @@ export interface ToolRequestRecord {
   result?: string;
 }
 
+/** One webhook delivery attempt (a ping to the owning client's notify URL). */
+export interface NotificationAttempt {
+  /** Ping kind, e.g. followup.promised. */
+  event: string;
+  /** Stable id (= idempotency key) shared by every attempt of the same ping. */
+  notificationId: string;
+  /** 1-based attempt counter within one ping (retries count up). */
+  attempt: number;
+  at: string;
+  url: string;
+  ok: boolean;
+  status?: number;
+  /** Why it failed: HTTP status text or the fetch error (e.g. ECONNREFUSED). */
+  error?: string;
+}
+
 export interface OrchestrationRecord {
   id: string;
   direction: 'inbound' | 'outbound';
@@ -34,6 +50,14 @@ export interface OrchestrationRecord {
   pendingRequests: ToolRequestRecord[];
   /** True when the agent promised a callback: run the tools, respond, call back. */
   followUpRequired: boolean;
+  /**
+   * True once the owning client's endpoint accepted (2xx) the followup.promised
+   * ping. Until then the promise has reached nobody and the gateway keeps
+   * re-delivering it.
+   */
+  followUpDelivered: boolean;
+  /** Every webhook delivery attempt for this call, oldest first (diagnosis). */
+  notifications: NotificationAttempt[];
   /** Full conversation once the call finishes. */
   turns: ConversationTurn[];
   /** Caller transcript lines observed so far, with prosody, for live polling. */
@@ -46,6 +70,8 @@ export interface OrchestrationRecord {
 
 /** Projection size cap: the event log keeps everything, RAM keeps the recent. */
 const MAX_RECORDS = 500;
+/** Delivery attempts kept per record (a dead endpoint re-pinged for days would otherwise grow it). */
+const MAX_NOTIFICATIONS = 40;
 
 export class OrchestrationLog {
   private records = new Map<string, OrchestrationRecord>();
@@ -88,6 +114,8 @@ export class OrchestrationLog {
           status: 'running',
           pendingRequests: [],
           followUpRequired: false,
+          followUpDelivered: false,
+          notifications: [],
           turns: [],
           liveTranscript: [],
           errors: [],
@@ -132,6 +160,17 @@ export class OrchestrationLog {
           if (requestIds.includes(r.id) && r.status === 'open') r.status = 'callback_promised';
         }
         record.followUpRequired = true;
+        break;
+      }
+      case 'orchestration.notified': {
+        const { id, ...attempt } = data as unknown as { id: string } & NotificationAttempt;
+        const record = this.records.get(id);
+        if (!record) return;
+        record.notifications.push(attempt);
+        if (record.notifications.length > MAX_NOTIFICATIONS) {
+          record.notifications.splice(0, record.notifications.length - MAX_NOTIFICATIONS);
+        }
+        if (attempt.ok && attempt.event === 'followup.promised') record.followUpDelivered = true;
         break;
       }
       case 'orchestration.finished': {
@@ -206,6 +245,30 @@ export class OrchestrationLog {
   followUpPromised(id: string, requestIds: string[]): void {
     this.ensureLoaded();
     this.appendAndApply(id, 'orchestration.followup_promised', { id, requestIds });
+  }
+
+  /** Record one webhook delivery attempt; returns the stored entry. */
+  notified(id: string, attempt: Omit<NotificationAttempt, 'at'>): NotificationAttempt {
+    this.ensureLoaded();
+    const stored: NotificationAttempt = { ...attempt, at: new Date().toISOString() };
+    this.appendAndApply(id, 'orchestration.notified', { id, ...stored });
+    return stored;
+  }
+
+  /**
+   * Finished calls that still owe a callback nobody has been told about:
+   * followUpRequired, the followup.promised ping never accepted, started on or
+   * after `sinceIso`. These get re-pinged until a receiver answers 2xx.
+   */
+  owedFollowUps(sinceIso: string): OrchestrationRecord[] {
+    this.ensureLoaded();
+    return [...this.records.values()].filter(
+      (r) =>
+        r.status !== 'running' &&
+        r.followUpRequired &&
+        !r.followUpDelivered &&
+        r.startedAt >= sinceIso,
+    );
   }
 
   finish(

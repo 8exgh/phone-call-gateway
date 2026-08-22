@@ -24,7 +24,7 @@ async function req(
 }
 
 /** A webhook receiver that records payloads (and can be told to hang forever). */
-function receiver(hang = false, statuses: number[] = []): Promise<{
+function receiver(hang = false, statuses: number[] = [], port = 0): Promise<{
   url: string;
   events: Record<string, unknown>[];
   headers: Record<string, string | string[] | undefined>[];
@@ -45,11 +45,30 @@ function receiver(hang = false, statuses: number[] = []): Promise<{
     });
   });
   return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => {
-      const port = (server.address() as AddressInfo).port;
-      resolve({ url: `http://127.0.0.1:${port}/hook`, events, headers, close: () => server.close() });
+    server.listen(port, '127.0.0.1', () => {
+      const bound = (server.address() as AddressInfo).port;
+      resolve({ url: `http://127.0.0.1:${bound}/hook`, events, headers, close: () => server.close() });
     });
   });
+}
+
+/** A port nothing listens on any more (connections to it are refused). */
+async function deadPort(): Promise<number> {
+  const probe = await receiver();
+  const port = Number(new URL(probe.url).port);
+  await new Promise<void>((resolve) => {
+    probe.close();
+    setTimeout(resolve, 50);
+  });
+  return port;
+}
+
+async function untilAsync(cond: () => Promise<boolean>, timeoutMs = 8000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!(await cond())) {
+    if (Date.now() > deadline) throw new Error('condition not met in time');
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
 }
 
 async function until(cond: () => boolean, timeoutMs = 8000): Promise<void> {
@@ -223,6 +242,155 @@ describe('webhook notifications (multi-client isolation)', () => {
     });
     await until(() => hook.events.length === 2);
     expect(hook.headers[0]!['idempotency-key']).toBe(hook.headers[1]!['idempotency-key']);
+  });
+
+  it('records every delivery attempt and keeps re-pinging an owed callback until a receiver accepts it', async () => {
+    const port = await deadPort(); // the client's endpoint is down when the promise is made
+    gw = await startGateway({
+      script: [
+        { pauseMs: 300 },
+        { waitForSayCompleted: true },
+        { speak: { text: 'weather in calgary please', durationMs: 1800 } },
+        { pauseMs: 6000 },
+      ],
+      chatClientFactory: () =>
+        new FakeChatClient([
+          { reply: '', toolCalls: [{ name: 'web_search', arguments: '{"query":"weather"}' }] },
+        ]),
+      serverConfig: {
+        adminApiKey: ADMIN,
+        dataDir: mkdtempSync(path.join(tmpdir(), 'pgw-notify-')),
+        quotaCacheTtlMs: 0,
+        toolTimeoutMs: 300,
+        notifyTimeoutMs: 300,
+        allowPrivateNotifyTargets: true,
+        notifyRetryDelaysMs: [50],
+        followUpRetryDelaysMs: [50],
+        followUpRedeliveryIntervalMs: 250,
+      },
+    });
+    const c = (await req(`${gw.baseUrl}/clients`, { token: ADMIN, body: { name: 'down' } }))
+      .json as unknown as { apiKey: string };
+    await req(`${gw.baseUrl}/numbers`, { token: c.apiKey, body: { areaCode: '431' } });
+    await req(`${gw.baseUrl}/notify-config`, {
+      token: c.apiKey,
+      body: { url: `http://127.0.0.1:${port}/hook` },
+    });
+    const placed = await req(`${gw.baseUrl}/orchestrations`, {
+      token: c.apiKey,
+      body: { to: '+15550001111', goal: 'weather', openingLine: 'Hello!' },
+    });
+    const id = String(placed.json.orchestrationId);
+    type Attempt = { event: string; ok: boolean; error?: string; notificationId: string; attempt: number };
+    const record = async (): Promise<{
+      followUpRequired: boolean;
+      followUpDelivered: boolean;
+      notifications: Attempt[];
+      pendingRequests: { id: string }[];
+    }> =>
+      (await req(`${gw.baseUrl}/orchestrations/${id}`, { token: c.apiKey })).json as never;
+
+    // The promise is recorded, and so is the fact that nobody received it.
+    await untilAsync(async () => {
+      const r = await record();
+      return (
+        r.followUpRequired &&
+        r.notifications.filter((n) => n.event === 'followup.promised' && !n.ok).length >= 2
+      );
+    });
+    const before = await record();
+    expect(before.followUpDelivered).toBe(false);
+    const refused = before.notifications.find((n) => n.event === 'followup.promised')!;
+    expect(refused.error).toMatch(/ECONNREFUSED/);
+    expect(refused.notificationId).toBe(`followup.promised:${id}:${before.pendingRequests[0]!.id}`);
+    expect(before.notifications.map((n) => n.attempt)).toContain(2); // the scheduled retry ran too
+
+    // The endpoint comes back: the sweep hands over the promise (same id, flagged as re-sent).
+    const hook = await receiver(false, [], port);
+    receivers.push(hook);
+    await until(() => hook.events.some((e) => e.event === 'followup.promised'));
+    expect(hook.events.find((e) => e.event === 'followup.promised')).toMatchObject({
+      orchestrationId: id,
+      notificationId: refused.notificationId,
+      redelivery: true,
+    });
+    await untilAsync(async () => (await record()).followUpDelivered);
+
+    // Accepted once: the sweep stops re-pinging.
+    const delivered = hook.events.filter((e) => e.event === 'followup.promised').length;
+    await new Promise((r) => setTimeout(r, 800));
+    expect(hook.events.filter((e) => e.event === 'followup.promised')).toHaveLength(delivered);
+  });
+
+  it('POST /orchestrations/:id/notify re-sends the owed callback and reports the outcome', async () => {
+    const port = await deadPort();
+    gw = await startGateway({
+      script: [
+        { pauseMs: 300 },
+        { waitForSayCompleted: true },
+        { speak: { text: 'weather in calgary please', durationMs: 1800 } },
+        { pauseMs: 6000 },
+      ],
+      chatClientFactory: () =>
+        new FakeChatClient([
+          { reply: '', toolCalls: [{ name: 'web_search', arguments: '{"query":"weather"}' }] },
+        ]),
+      serverConfig: {
+        adminApiKey: ADMIN,
+        dataDir: mkdtempSync(path.join(tmpdir(), 'pgw-notify-')),
+        quotaCacheTtlMs: 0,
+        toolTimeoutMs: 300,
+        notifyTimeoutMs: 300,
+        allowPrivateNotifyTargets: true,
+        notifyRetryDelaysMs: [],
+        followUpRetryDelaysMs: [],
+        followUpRedeliveryIntervalMs: 0,
+      },
+    });
+    const c = (await req(`${gw.baseUrl}/clients`, { token: ADMIN, body: { name: 'manual' } }))
+      .json as unknown as { apiKey: string };
+    const other = (await req(`${gw.baseUrl}/clients`, { token: ADMIN, body: { name: 'other' } }))
+      .json as unknown as { apiKey: string };
+    await req(`${gw.baseUrl}/numbers`, { token: c.apiKey, body: { areaCode: '431' } });
+    await req(`${gw.baseUrl}/notify-config`, {
+      token: c.apiKey,
+      body: { url: `http://127.0.0.1:${port}/hook` },
+    });
+    const placed = await req(`${gw.baseUrl}/orchestrations`, {
+      token: c.apiKey,
+      body: { to: '+15550001111', goal: 'weather', openingLine: 'Hello!' },
+    });
+    const id = String(placed.json.orchestrationId);
+    const notifyUrl = `${gw.baseUrl}/orchestrations/${id}/notify`;
+    await untilAsync(
+      async () =>
+        Boolean((await req(`${gw.baseUrl}/orchestrations/${id}`, { token: c.apiKey })).json.followUpRequired),
+    );
+
+    // Still down: the outcome is reported, not hidden.
+    let sent = await req(notifyUrl, { token: c.apiKey, body: {} });
+    expect(sent.status).toBe(200);
+    expect(sent.json.followUpDelivered).toBe(false);
+    expect(sent.json.attempt).toMatchObject({ event: 'followup.promised', ok: false });
+    expect(String((sent.json.attempt as { error: string }).error)).toMatch(/ECONNREFUSED/);
+
+    // Receiver back: the re-send lands and the debt is marked delivered.
+    const hook = await receiver(false, [], port);
+    receivers.push(hook);
+    sent = await req(notifyUrl, { token: c.apiKey, body: {} });
+    expect(sent.status).toBe(200);
+    expect(sent.json.followUpDelivered).toBe(true);
+    expect(sent.json.attempt).toMatchObject({ ok: true, status: 200 });
+    expect(hook.events[0]).toMatchObject({ event: 'followup.promised', orchestrationId: id, redelivery: true });
+
+    // Scoped like everything else; and once answered there is nothing left to re-send.
+    expect((await req(notifyUrl, { token: other.apiKey, body: {} })).status).toBe(404);
+    const requestId = (hook.events[0]!.requestIds as string[])[0]!;
+    await req(`${gw.baseUrl}/orchestrations/${id}/respond`, {
+      token: c.apiKey,
+      body: { requestId, result: 'Sunny, 24C.' },
+    });
+    expect((await req(notifyUrl, { token: c.apiKey, body: {} })).status).toBe(409);
   });
 
   it('rejects private notify targets unless explicitly allowed', async () => {

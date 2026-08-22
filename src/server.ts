@@ -6,7 +6,11 @@ import { buildRejectTwiml, buildStreamTwiml } from './telephony/twiml';
 import { areaCodeCandidates } from './telephony/areaCodes';
 import { EventStore } from './store/eventStore';
 import { ClientStore, type ClientRecord } from './store/clientStore';
-import { OrchestrationLog, type OrchestrationRecord } from './store/orchestrationLog';
+import {
+  OrchestrationLog,
+  type NotificationAttempt,
+  type OrchestrationRecord,
+} from './store/orchestrationLog';
 import { z } from 'zod';
 import { CallRegistry } from './call/callRegistry';
 import { CallSession } from './call/callSession';
@@ -57,6 +61,18 @@ export interface ServerConfig {
   toolTimeoutMs?: number;
   /** Timeout per webhook notification attempt (default 5s). */
   notifyTimeoutMs?: number;
+  /** Delays (ms) between retries of a failed ping; default one retry after 2s. */
+  notifyRetryDelaysMs?: number[];
+  /** Retry schedule for pings that carry an owed callback (default ~3.5 min of backoff). */
+  followUpRetryDelaysMs?: number[];
+  /**
+   * How often owed callbacks nobody has accepted yet are re-pinged (default
+   * 5 min; 0 disables). This is what delivers a promise made while the
+   * client's endpoint was down.
+   */
+  followUpRedeliveryIntervalMs?: number;
+  /** How far back the re-delivery sweep looks (default 72h). */
+  followUpRedeliveryWindowMs?: number;
   /** Tests only: allow loopback/private notify targets. */
   allowPrivateNotifyTargets?: boolean;
 }
@@ -596,40 +612,145 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
   /** Live orchestrator instances, for feeding tool results into running calls. */
   const runningOrchestrators = new Map<string, Orchestrator>();
 
+  const DEFAULT_RETRY_DELAYS_MS = [2000];
+  const DEFAULT_FOLLOW_UP_RETRY_DELAYS_MS = [2000, 10_000, 30_000, 60_000, 120_000];
+
+  const describeFetchError = (error: unknown): string => {
+    const e = error as { name?: string; message?: string; cause?: { code?: string; message?: string } };
+    const cause = e.cause?.code ?? e.cause?.message;
+    return `${e.name ?? 'Error'}: ${e.message ?? String(error)}${cause ? ` (${cause})` : ''}`;
+  };
+
   /**
-   * Fire-and-forget webhook ping to one client. Fully isolated: runs off the
-   * call path, per-client URL, independent fetch with its own timeout, one
-   * quiet retry, errors swallowed — a dead or slow endpoint for one client
-   * can never affect another client's calls (polling remains the fallback).
+   * Webhook ping to one client. Fully isolated from the call path: per-client
+   * URL, independent fetch with its own timeout, retries in the background,
+   * never throws — a dead or slow endpoint for one client can never affect
+   * another client's calls (polling remains the fallback). Every attempt is
+   * recorded on the orchestration (notifications[]) so an undelivered ping is
+   * visible rather than silently lost. Resolves with the first attempt's
+   * outcome (null when the client has no notify URL).
    */
-  const notifyClient = (clientId: string | undefined, payload: Record<string, unknown>): void => {
-    if (!clientId) return;
+  const notifyClient = (
+    clientId: string | undefined,
+    payload: Record<string, unknown>,
+    opts: { retryDelaysMs?: number[] } = {},
+  ): Promise<NotificationAttempt | null> => {
+    if (!clientId) return Promise.resolve(null);
     const client = store.get(clientId);
     const url = client?.notifyUrl;
-    if (!url) return;
+    if (!url) return Promise.resolve(null);
+    const event = String(payload.event ?? 'phone');
+    const orchestrationId = String(payload.orchestrationId ?? 'unknown');
     const notificationId = [
-      String(payload.event ?? 'phone'),
-      String(payload.orchestrationId ?? 'unknown'),
+      event,
+      orchestrationId,
       String(payload.requestId ?? (payload.requestIds as string[] | undefined)?.join(',') ?? ''),
     ].join(':');
     const body = JSON.stringify({ ...payload, notificationId, idempotencyKey: notificationId });
-    const attempt = async (): Promise<void> => {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'idempotency-key': notificationId,
-          ...(client?.notifyHeaders ?? {}),
-        },
-        body,
-        signal: AbortSignal.timeout(config.notifyTimeoutMs ?? 5000),
-      });
-      if (!response.ok) throw new Error(`notify endpoint returned HTTP ${response.status}`);
+    const retryDelays = opts.retryDelaysMs ?? config.notifyRetryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
+    const attempt = async (n: number): Promise<NotificationAttempt> => {
+      const base = { event, notificationId, attempt: n, url };
+      let outcome: Omit<NotificationAttempt, 'at'>;
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'idempotency-key': notificationId,
+            ...(client?.notifyHeaders ?? {}),
+          },
+          body,
+          signal: AbortSignal.timeout(config.notifyTimeoutMs ?? 5000),
+        });
+        outcome = response.ok
+          ? { ...base, ok: true, status: response.status }
+          : { ...base, ok: false, status: response.status, error: `HTTP ${response.status}` };
+      } catch (error) {
+        outcome = { ...base, ok: false, error: describeFetchError(error) };
+      }
+      if (!outcome.ok) {
+        console.warn(
+          `notify ${event} for ${orchestrationId} -> ${url} failed (attempt ${n}): ${outcome.error}`,
+        );
+      }
+      return orchestrations.get(orchestrationId)
+        ? orchestrations.notified(orchestrationId, outcome)
+        : { ...outcome, at: new Date().toISOString() };
     };
-    void attempt().catch(() =>
-      new Promise((r) => setTimeout(r, 2000)).then(attempt).catch(() => undefined),
-    );
+    const first = attempt(1);
+    void first.then(async (outcome) => {
+      let last = outcome;
+      for (const [i, delay] of retryDelays.entries()) {
+        if (last.ok) return;
+        await new Promise((r) => setTimeout(r, delay));
+        last = await attempt(i + 2);
+      }
+    });
+    return first;
   };
+
+  const followUpRetryDelays = (): number[] =>
+    config.followUpRetryDelaysMs ?? DEFAULT_FOLLOW_UP_RETRY_DELAYS_MS;
+
+  /** The ping that hands an owed callback to the client; stable id per owed request set. */
+  const followUpPayload = (
+    record: OrchestrationRecord,
+    opts: { requestIds?: string[]; redelivery?: boolean } = {},
+  ): Record<string, unknown> => {
+    const requestIds =
+      opts.requestIds ??
+      record.pendingRequests.filter((r) => r.status === 'callback_promised').map((r) => r.id);
+    const other = record.direction === 'inbound' ? record.from : record.to;
+    return {
+      event: 'followup.promised',
+      message:
+        `Phone gateway: the call with ${other} ${opts.redelivery ? 'ended' : 'just ended'} with a PROMISED CALLBACK` +
+        `${opts.redelivery ? ' (re-sent: an earlier ping was not delivered)' : ''}. ` +
+        `GET $PHONE_GATEWAY_URL/orchestrations/${record.id} for the pending tool requests, execute them with your real capabilities, ` +
+        `POST each result to /orchestrations/${record.id}/respond, then IMMEDIATELY place a call back to the person delivering the answer. A promise was made in your name.`,
+      orchestrationId: record.id,
+      requestIds,
+      to: record.to,
+      from: record.from,
+      statusUrl: `/orchestrations/${record.id}`,
+      ...(opts.redelivery ? { redelivery: true } : {}),
+    };
+  };
+
+  // Promised callbacks whose ping nobody accepted (endpoint down, 5xx, wrong
+  // port...) are re-pinged on a slow cadence until a receiver answers 2xx —
+  // the promise must reach someone, however late. Same notificationId each
+  // time, so receivers dedupe.
+  const redeliveryInFlight = new Set<string>();
+  const redeliverOwedFollowUps = async (): Promise<void> => {
+    const windowMs = config.followUpRedeliveryWindowMs ?? 72 * 3600_000;
+    const since = new Date(Date.now() - windowMs).toISOString();
+    for (const record of orchestrations.owedFollowUps(since)) {
+      if (!record.clientId || redeliveryInFlight.has(record.id)) continue;
+      redeliveryInFlight.add(record.id);
+      try {
+        await notifyClient(record.clientId, followUpPayload(record, { redelivery: true }), {
+          retryDelaysMs: [],
+        });
+      } finally {
+        redeliveryInFlight.delete(record.id);
+      }
+    }
+  };
+  const redeliveryIntervalMs = config.followUpRedeliveryIntervalMs ?? 5 * 60_000;
+  const redeliveryTimers: NodeJS.Timeout[] = [];
+  if (redeliveryIntervalMs > 0) {
+    // One early sweep after boot (a restart must not delay an owed callback by
+    // a full interval), then the steady cadence. Unref'd: never keeps the
+    // process alive on its own.
+    redeliveryTimers.push(
+      setTimeout(() => void redeliverOwedFollowUps(), Math.min(redeliveryIntervalMs, 10_000)).unref(),
+      setInterval(() => void redeliverOwedFollowUps(), redeliveryIntervalMs).unref(),
+    );
+  }
+  app.addHook('onClose', async () => {
+    for (const timer of redeliveryTimers) clearTimeout(timer);
+  });
 
   const runOrchestrator = (
     record: OrchestrationRecord,
@@ -654,7 +775,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
           name: request.name,
           arguments: request.arguments,
         });
-        notifyClient(record.clientId, {
+        void notifyClient(record.clientId, {
           event: 'tool.requested',
           message:
             `URGENT phone gateway: a LIVE call is holding the line for tool ${request.name}(${request.arguments}). ` +
@@ -670,17 +791,8 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
       },
       onToolTimeout: (requestIds) => {
         orchestrations.followUpPromised(record.id, requestIds);
-        notifyClient(record.clientId, {
-          event: 'followup.promised',
-          message:
-            `Phone gateway: the call with ${record.direction === 'inbound' ? record.from : record.to} just ended with a PROMISED CALLBACK. ` +
-            `GET $PHONE_GATEWAY_URL/orchestrations/${record.id} for the pending tool requests, execute them with your real capabilities, ` +
-            `POST each result to /orchestrations/${record.id}/respond, then IMMEDIATELY place a call back to the person delivering the answer. A promise was made in your name.`,
-          orchestrationId: record.id,
-          requestIds,
-          to: record.to,
-          from: record.from,
-          statusUrl: `/orchestrations/${record.id}`,
+        void notifyClient(record.clientId, followUpPayload(record, { requestIds }), {
+          retryDelaysMs: followUpRetryDelays(),
         });
       },
       turnTimeoutMs: 15_000,
@@ -714,22 +826,26 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
           timeline: record.events,
         });
         if (record.direction === 'inbound' || record.followUpRequired) {
-          notifyClient(record.clientId, {
-            event: 'call.ended',
-            message:
-              `Phone gateway: the ${record.direction} call with ${record.direction === 'inbound' ? record.from : record.to} ended (${record.status}${record.reason ? `: ${record.reason}` : ''}). ` +
-              (record.followUpRequired
-                ? 'A CALLBACK IS OWED: fetch the record, execute the pending requests, respond, and call them back now.'
-                : `Review the transcript at $PHONE_GATEWAY_URL/orchestrations/${record.id} and act on any message taken.`),
-            orchestrationId: record.id,
-            direction: record.direction,
-            from: record.from,
-            to: record.to,
-            status: record.status,
-            reason: record.reason,
-            followUpRequired: record.followUpRequired,
-            statusUrl: `/orchestrations/${record.id}`,
-          });
+          void notifyClient(
+            record.clientId,
+            {
+              event: 'call.ended',
+              message:
+                `Phone gateway: the ${record.direction} call with ${record.direction === 'inbound' ? record.from : record.to} ended (${record.status}${record.reason ? `: ${record.reason}` : ''}). ` +
+                (record.followUpRequired
+                  ? 'A CALLBACK IS OWED: fetch the record, execute the pending requests, respond, and call them back now.'
+                  : `Review the transcript at $PHONE_GATEWAY_URL/orchestrations/${record.id} and act on any message taken.`),
+              orchestrationId: record.id,
+              direction: record.direction,
+              from: record.from,
+              to: record.to,
+              status: record.status,
+              reason: record.reason,
+              followUpRequired: record.followUpRequired,
+              statusUrl: `/orchestrations/${record.id}`,
+            },
+            record.followUpRequired ? { retryDelaysMs: followUpRetryDelays() } : {},
+          );
         }
       })
       .catch((error: Error) => {
@@ -822,6 +938,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
         startedAt: r.startedAt,
         clientId: r.clientId,
         followUpRequired: r.followUpRequired,
+        followUpDelivered: r.followUpDelivered,
         openRequests: r.pendingRequests.filter((q) => q.status !== 'answered').length,
         to: r.to,
         from: r.from,
@@ -914,7 +1031,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
       from: params.From ?? 'unknown',
       goal: policy.goal,
     });
-    notifyClient(owner?.id, {
+    void notifyClient(owner?.id, {
       event: 'call.inbound.started',
       message:
         `Phone gateway: incoming call from ${record.from} is being answered on your number right now. ` +
@@ -1123,6 +1240,29 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     orchestrations.toolAnswered(id, request.id, parsed.data.result);
     const live = runningOrchestrators.get(id)?.provideToolResult(request.id, parsed.data.result);
     return { request, deliveredLive: live ?? false };
+  });
+
+  // Re-send the owed-callback ping on demand (after fixing a dead receiver,
+  // say) and report how that delivery went — the same ping, same
+  // notificationId, so an agent that did get it earlier just dedupes.
+  app.post('/orchestrations/:id/notify', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
+    const { id } = req.params as { id: string };
+    const record = orchestrations.get(id);
+    if (!record || (auth.kind === 'client' && record.clientId !== auth.client.id)) {
+      return reply.code(404).send({ error: 'no such orchestration' });
+    }
+    if (!record.followUpRequired) {
+      return reply.code(409).send({ error: 'no callback is owed on this orchestration' });
+    }
+    if (!record.clientId || !store.get(record.clientId)?.notifyUrl) {
+      return reply.code(400).send({ error: 'this client has no notify url (POST /notify-config first)' });
+    }
+    const attempt = await notifyClient(record.clientId, followUpPayload(record, { redelivery: true }), {
+      retryDelaysMs: [],
+    });
+    return { orchestrationId: id, followUpDelivered: record.followUpDelivered, attempt };
   });
 
   app.get('/calls/:callId', async (req, reply) => {
