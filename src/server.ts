@@ -796,6 +796,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
         });
       },
       turnTimeoutMs: 15_000,
+      onLlmError: (message) => orchestrations.error(record.id, `llm_failed: ${message}`),
       onEvent: (event) => {
         // The debug timeline stays in memory while the call runs and is
         // persisted in one piece with the finished event.
