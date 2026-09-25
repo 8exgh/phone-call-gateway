@@ -10,6 +10,9 @@ import type { ChatClient, ChatMessage, ToolCallRequest, ToolDef } from './chatCl
 /** When the LLM's reply contains this marker, the call is ended after speaking. */
 export const HANGUP_MARKER = 'HANGUP';
 
+/** After an LLM failure the apology is spoken and the call hung up; if it cannot be spoken, hang up anyway. */
+const LLM_FAILURE_HANGUP_MS = 10_000;
+
 export interface OrchestratorOptions {
   /** ws:// URL of the gateway's control socket for the call. */
   controlUrl: string;
@@ -33,6 +36,8 @@ export interface OrchestratorOptions {
   turnTimeoutMs?: number;
   /** ms to wait after the last keypress before handing the digits to the LLM. */
   dtmfFlushMs?: number;
+  /** Fired once when the LLM fails mid-call; the call is wound down with an apology and hung up. */
+  onLlmError?: (message: string) => void;
   /** Observer for every server event (used by the CLI for live printing). */
   onEvent?: (event: ServerMessage) => void;
 }
@@ -148,6 +153,8 @@ export class Orchestrator {
   private hangupAfterSayId: string | null = null;
   private silenceTimer: NodeJS.Timeout | null = null;
   private finished = false;
+  /** First fatal LLM error; turns the final state into 'failed' with this reason. */
+  private fatalError: string | null = null;
   /** Bumped on every barge-in; says from an older generation are stale. */
   private bargeInGeneration = 0;
   private dtmfBuffer = '';
@@ -198,6 +205,10 @@ export class Orchestrator {
   private finish(finalState: 'ended' | 'failed', reason?: string): void {
     if (this.finished) return;
     this.finished = true;
+    if (this.fatalError !== null && finalState === 'ended') {
+      finalState = 'failed';
+      reason = this.fatalError;
+    }
     this.disarmSilenceTimer();
     if (this.dtmfTimer) clearTimeout(this.dtmfTimer);
     this.abortToolWait?.();
@@ -299,9 +310,30 @@ export class Orchestrator {
         this.history.push({ role: 'user', content: prefix + userContent });
         await this.generateUntilSpoken();
       }
+    } catch (error) {
+      // respond() runs fire-and-forget from event handlers: a rejection here
+      // would be unhandled and take the whole gateway down with every call
+      // on it. Wind this one call down instead.
+      this.onLlmFailure(error);
     } finally {
       this.llmBusy = false;
     }
+  }
+
+  private onLlmFailure(error: unknown): void {
+    if (this.finished) return;
+    const message = error instanceof Error ? error.message : String(error);
+    if (this.fatalError === null) {
+      this.fatalError = `llm_failed: ${message}`.slice(0, 500);
+      this.opts.onLlmError?.(message);
+    }
+    // generateUntilSpoken already queued the apology and asked to hang up once
+    // it has played. If speech is failing too, do not leave the callee on a
+    // silent line: hang up regardless.
+    const timer = setTimeout(() => {
+      if (!this.finished) this.send({ type: 'hangup' });
+    }, LLM_FAILURE_HANGUP_MS);
+    timer.unref();
   }
 
   /**

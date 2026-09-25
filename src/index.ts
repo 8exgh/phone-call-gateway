@@ -69,6 +69,11 @@ async function main(): Promise<void> {
 }
 
 if (require.main === module) {
+  // Every call on this process dies with it. A stray rejection (a failed
+  // upstream request in a code path nobody awaited) must not become a crash.
+  process.on('unhandledRejection', (reason) => {
+    console.error('[gateway] unhandled promise rejection (process kept running):', reason);
+  });
   main().catch((err) => {
     console.error(err);
     process.exit(1);
