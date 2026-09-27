@@ -21,7 +21,7 @@ class FakeTranscriberSession implements TranscriberSession {
   private deltaSent = false;
 
   constructor(
-    private readonly utterances: string[],
+    private readonly utterances: (string | null)[],
     private readonly callbacks: TranscriberCallbacks,
   ) {}
 
@@ -37,7 +37,7 @@ class FakeTranscriberSession implements TranscriberSession {
       }
       if (this.inUtterance && !this.deltaSent) {
         const text = this.utterances[this.utteranceIndex];
-        if (text !== undefined) {
+        if (text !== undefined && text !== null) {
           this.callbacks.onDelta(text.split(/\s+/).slice(0, 2).join(' '));
         }
         this.deltaSent = true;
@@ -46,7 +46,7 @@ class FakeTranscriberSession implements TranscriberSession {
       this.silenceMs += ms;
       if (this.inUtterance && this.silenceMs >= ENDPOINT_SILENCE_MS) {
         const text = this.utterances[this.utteranceIndex++];
-        if (text !== undefined) {
+        if (text !== undefined && text !== null) {
           this.callbacks.onCompleted(text, 0.95);
         }
         this.inUtterance = false;

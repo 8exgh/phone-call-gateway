@@ -95,7 +95,9 @@ curl -s -X POST "$PHONE_GATEWAY_URL/orchestrations" \
 ```
 
 Fields: `to` (E.164, required), `goal` (what the voice agent should achieve),
-`openingLine` (optional fixed first sentence; omit to let the LLM open),
+`openingLine` (optional fixed first sentence; omit to let the LLM open), `awaitGreeting`,
+`silenceTimeoutMs` and `promptOnUnclearSpeech` (opt-in manners for business lines; see the
+README),
 `voice` (optional OpenAI TTS voice), `from` (optional; defaults to the
 gateway's configured number, currently +15877417105).
 

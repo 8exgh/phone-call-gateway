@@ -105,6 +105,16 @@ Caller [volume: whisper, pace: normal]: okay... fine. that sounds reasonable.
     -d '{"to":"+15551234567","goal":"Book a table for 2 at 7pm Friday under Ana"}'
   # → {"orchestrationId":"...","statusUrl":"/orchestrations/..."}
   ```
+
+  Calling a business line, three opt-in options change how the agent behaves (all off by
+  default, so existing callers are unaffected):
+  `awaitGreeting: true` holds the opening until whoever picks up (a receptionist, a phone
+  menu) has spoken, answering their words when they come through and opening after a short
+  pause when they do not; `silenceTimeoutMs` (0–120000, default 15000, 0 never) is how long
+  the line may be silent after the agent speaks before it re-engages, so a hold or a transfer
+  is not talked into; `promptOnUnclearSpeech: true` gives the agent a turn to say it did not
+  catch that when a voice is heard but no words come through, instead of going quiet (at
+  most four times a call, eight seconds apart).
 - REST — webhook push + owed callbacks: `POST /notify-config {url, headers?}` registers a
   per-client endpoint the gateway pings (`tool.requested`, `followup.promised`,
   `call.inbound.started`, `call.ended`). Every delivery attempt is recorded on the

@@ -116,6 +116,12 @@ const orchestrationBodySchema = z.object({
   voice: z.string().optional(),
   /** Tools the voice agent may invoke mid-call; defaults to DEFAULT_TOOLS. */
   tools: z.array(toolDefSchema).max(32).optional(),
+  /** Let whoever picks up speak first (a greeting, a phone menu); the opening waits for them. */
+  awaitGreeting: z.boolean().optional(),
+  /** ms of silence after the agent speaks before it re-engages; default 15000, 0 never. */
+  silenceTimeoutMs: z.number().int().min(0).max(120_000).optional(),
+  /** When the other side is heard but no words come through, the agent says it did not catch that. */
+  promptOnUnclearSpeech: z.boolean().optional(),
 });
 
 const respondBodySchema = z.object({
@@ -754,7 +760,14 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
 
   const runOrchestrator = (
     record: OrchestrationRecord,
-    opts: { openingLine?: string; voice?: string; tools?: z.infer<typeof toolDefSchema>[] },
+    opts: {
+      openingLine?: string;
+      voice?: string;
+      tools?: z.infer<typeof toolDefSchema>[];
+      awaitGreeting?: boolean;
+      silenceTimeoutMs?: number;
+      promptOnUnclearSpeech?: boolean;
+    },
   ): void => {
     const startedAt = Date.now();
     const orchestrator = new Orchestrator({
@@ -795,7 +808,9 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
           retryDelaysMs: followUpRetryDelays(),
         });
       },
-      turnTimeoutMs: 15_000,
+      turnTimeoutMs: opts.silenceTimeoutMs ?? 15_000,
+      awaitGreeting: opts.awaitGreeting,
+      promptOnUnclearSpeech: opts.promptOnUnclearSpeech,
       onLlmError: (message) => orchestrations.error(record.id, `llm_failed: ${message}`),
       onEvent: (event) => {
         // The debug timeline stays in memory while the call runs and is
@@ -892,6 +907,9 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
       openingLine: parsed.data.openingLine,
       voice: parsed.data.voice,
       tools: parsed.data.tools,
+      awaitGreeting: parsed.data.awaitGreeting,
+      silenceTimeoutMs: parsed.data.silenceTimeoutMs,
+      promptOnUnclearSpeech: parsed.data.promptOnUnclearSpeech,
     });
 
     return reply.code(202).send({

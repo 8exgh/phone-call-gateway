@@ -16,6 +16,11 @@ export interface SpeakSpec {
   frequencyHz?: number;
   /** Render as short bursts with gaps, to exercise the choppiness detector. */
   choppy?: boolean;
+  /**
+   * Heard (real audio, so voice activity fires) but the transcriber makes out
+   * no words, as real STT does with a short or muffled "hello?".
+   */
+  unintelligible?: boolean;
 }
 
 export type CallerScriptStep =
@@ -35,10 +40,11 @@ export type CallerScriptStep =
 
 export type CallerScript = CallerScriptStep[];
 
-export function scriptUtterances(script: CallerScript): string[] {
-  const texts: string[] = [];
+/** The transcriber's text for each speak step, in order; null where no words come through. */
+export function scriptUtterances(script: CallerScript): (string | null)[] {
+  const texts: (string | null)[] = [];
   for (const step of script) {
-    if ('speak' in step) texts.push(step.speak.text);
+    if ('speak' in step) texts.push(step.speak.unintelligible ? null : step.speak.text);
   }
   return texts;
 }

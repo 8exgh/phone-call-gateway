@@ -34,6 +34,26 @@ export interface OrchestratorOptions {
   onToolTimeout?: (requestIds: string[]) => void;
   /** ms of caller silence (after our say completes) before re-engaging; 0 disables. */
   turnTimeoutMs?: number;
+  /**
+   * Let the other side speak first when the call connects (a receptionist's
+   * greeting, a phone menu). The opening (the line, or the LLM's) waits until
+   * they have spoken, or until nobody has said anything for greetingWaitMs.
+   * When their words come through, the LLM answers them instead of the
+   * opening line being recited over the top of them.
+   */
+  awaitGreeting?: boolean;
+  /** With awaitGreeting: ms after the call connects to wait for them to speak. Default 4000. */
+  greetingWaitMs?: number;
+  /** With awaitGreeting: ms after their greeting stops, with no words made out, before opening. Default 1500. */
+  greetingPauseMs?: number;
+  /**
+   * When the other side is heard but no words come through (a short "hello?"
+   * the transcriber drops), give the LLM a turn to say it did not catch that
+   * instead of staying silent. Rate-limited, a few times per call.
+   */
+  promptOnUnclearSpeech?: boolean;
+  /** With promptOnUnclearSpeech: ms after their speech stops, with no words, before prompting. Default 2000. */
+  unclearSpeechMs?: number;
   /** ms to wait after the last keypress before handing the digits to the LLM. */
   dtmfFlushMs?: number;
   /** Fired once when the LLM fails mid-call; the call is wound down with an apology and hung up. */
@@ -124,6 +144,10 @@ When the conversation should end, include the word ${HANGUP_MARKER} anywhere in 
 
 const PRESS_PATTERN = /PRESS\(([0-9A-Da-d*#wW]{1,32})\)/g;
 
+/** promptOnUnclearSpeech: at most this many prompts per call, this far apart. */
+const MAX_UNCLEAR_PROMPTS = 4;
+const UNCLEAR_COOLDOWN_MS = 8000;
+
 const HOLD_LINE = 'One moment while I check that for you.';
 const REASSURE_LINE = 'Thanks for your patience — still checking.';
 const CALLBACK_LINE =
@@ -163,6 +187,12 @@ export class Orchestrator {
   private readonly pendingToolWaits = new Map<string, (result: string) => void>();
   private toolHoldActive = false;
   private abortToolWait: (() => void) | null = null;
+  /** Whether the call has been opened (opening line said, or the LLM given the first turn). */
+  private opened = false;
+  private greetingTimer: NodeJS.Timeout | null = null;
+  private unclearTimer: NodeJS.Timeout | null = null;
+  private unclearPrompts = 0;
+  private lastUnclearPromptAt = 0;
 
   constructor(private readonly opts: OrchestratorOptions) {
     this.history.push({ role: 'system', content: opts.systemPrompt + SYSTEM_SUFFIX });
@@ -210,6 +240,8 @@ export class Orchestrator {
       reason = this.fatalError;
     }
     this.disarmSilenceTimer();
+    this.clearGreetingTimer();
+    this.clearUnclearTimer();
     if (this.dtmfTimer) clearTimeout(this.dtmfTimer);
     this.abortToolWait?.();
     this.resolveRun?.({ finalState, reason, turns: this.turns });
@@ -236,6 +268,7 @@ export class Orchestrator {
         break;
       case 'dtmf':
         this.disarmSilenceTimer();
+        this.clearUnclearTimer();
         // Keys often come in bursts (extensions, PINs): buffer briefly and
         // hand the LLM the whole sequence as one turn.
         this.dtmfBuffer += msg.digit;
@@ -243,6 +276,27 @@ export class Orchestrator {
         this.dtmfTimer = setTimeout(() => this.flushDtmf(), this.opts.dtmfFlushMs ?? 1200);
         break;
       case 'transcript': {
+        this.clearUnclearTimer();
+        if (msg.text.trim() === '') {
+          // Heard, no words: before the opening, the greeting pause decides;
+          // after it, say so when asked to (otherwise as before)
+          if (this.opts.awaitGreeting && !this.opened) break;
+          if (this.opts.promptOnUnclearSpeech) {
+            this.promptUnclear();
+            break;
+          }
+        }
+        if (this.opts.awaitGreeting && !this.opened) {
+          // They spoke first and we have their words: answer them rather than
+          // reciting the opening line over the top of them
+          this.opened = true;
+          this.clearGreetingTimer();
+          if (this.opts.openingLine) {
+            this.pendingUserTexts.push(
+              `[The call has just been answered and they spoke first. Your planned opening was: "${this.opts.openingLine}". Answer them naturally instead.]`,
+            );
+          }
+        }
         const recentAgentTexts = this.turns
           .filter((t) => t.role === 'agent')
           .slice(-2)
@@ -260,8 +314,23 @@ export class Orchestrator {
         // fires continuously and would mute the agent completely (observed
         // in the field). Words are the trigger — see transcript.delta.
         this.disarmSilenceTimer();
+        this.clearUnclearTimer();
+        // They are talking: never open over the top of them
+        if (this.opts.awaitGreeting && !this.opened) this.clearGreetingTimer();
+        break;
+      case 'speech.stopped':
+        if (this.opts.awaitGreeting && !this.opened) {
+          // They had their say: answer their words when they come through,
+          // or open after a short pause if none do
+          this.armGreetingTimer(this.opts.greetingPauseMs ?? 1500);
+        } else if (this.opts.promptOnUnclearSpeech && this.opened) {
+          this.armUnclearTimer();
+        }
         break;
       case 'transcript.delta':
+        this.clearUnclearTimer();
+        // Words are coming: wait for them, but never forever
+        if (this.opts.awaitGreeting && !this.opened) this.armGreetingTimer(this.opts.greetingWaitMs ?? 4000);
         // Barge-in: the STT recognizes actual words while we are speaking —
         // stop our audio and mark any still-streaming reply as superseded.
         if (this.saysInFlight.size > 0) {
@@ -287,12 +356,70 @@ export class Orchestrator {
   }
 
   private onCallActive(): void {
+    if (this.opts.awaitGreeting) {
+      // Hold the opening until they have had their say (speech.stopped,
+      // transcript), or until nobody has said anything for a while
+      this.armGreetingTimer(this.opts.greetingWaitMs ?? 4000);
+      return;
+    }
+    this.open();
+  }
+
+  private open(): void {
+    if (this.opened || this.finished) return;
+    this.opened = true;
+    this.clearGreetingTimer();
     if (this.opts.openingLine) {
       this.say(this.opts.openingLine);
     } else {
       this.pendingUserTexts.push('[The call has just been answered. Open the conversation.]');
       void this.respond();
     }
+  }
+
+  private armGreetingTimer(ms: number): void {
+    this.clearGreetingTimer();
+    this.greetingTimer = setTimeout(() => {
+      this.greetingTimer = null;
+      this.open();
+    }, ms);
+  }
+
+  private clearGreetingTimer(): void {
+    if (this.greetingTimer) {
+      clearTimeout(this.greetingTimer);
+      this.greetingTimer = null;
+    }
+  }
+
+  private armUnclearTimer(): void {
+    this.clearUnclearTimer();
+    this.unclearTimer = setTimeout(() => {
+      this.unclearTimer = null;
+      this.promptUnclear();
+    }, this.opts.unclearSpeechMs ?? 2000);
+  }
+
+  private clearUnclearTimer(): void {
+    if (this.unclearTimer) {
+      clearTimeout(this.unclearTimer);
+      this.unclearTimer = null;
+    }
+  }
+
+  /** They were heard but no words came through: let the LLM say it did not catch that. */
+  private promptUnclear(): void {
+    if (this.finished || !this.opened || this.toolHoldActive || this.llmBusy) return;
+    if (this.saysInFlight.size > 0 || this.hangupAfterSayId !== null) return;
+    const now = Date.now();
+    if (this.unclearPrompts >= MAX_UNCLEAR_PROMPTS || now - this.lastUnclearPromptAt < UNCLEAR_COOLDOWN_MS) return;
+    this.unclearPrompts++;
+    this.lastUnclearPromptAt = now;
+    this.disarmSilenceTimer();
+    this.pendingUserTexts.push(
+      '[They said something, but it could not be made out. Say briefly that you did not catch that, and ask your last question again in a few words.]',
+    );
+    void this.respond();
   }
 
   private async respond(): Promise<void> {
