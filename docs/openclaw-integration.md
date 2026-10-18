@@ -155,6 +155,10 @@ Poll every few seconds until `status` is `ended` or `failed`:
 - `reason`: `hangup` = our agent ended it, `remote_hangup` = they did.
 - `errors` lists in-call failures (e.g. `stt_failed`); `events` is a full
   timeline for debugging.
+- If the TTS provider fails (`tts_failed`, e.g. an OpenAI spend-limit 429) the
+  gateway plays a built-in "Out of OpenAI tokens." clip in place of the failed
+  line, hangs up once it has played, and the orchestration ends `failed` with
+  `reason: "tts_failed: …"` — the goal was not delivered.
 
 Error responses: `400` invalid body or no from-number configured, `424` the
 upstream Twilio call couldn't be created (body has the reason).

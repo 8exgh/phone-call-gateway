@@ -1,4 +1,5 @@
 import { startGateway, post, ControlClient, type Gateway } from './helpers';
+import { ttsFallbackClip } from '../../src/speech/ttsFallbackClip';
 import type { SpeechSynthesizer, SynthesizeOptions } from '../../src/speech/synthesizer';
 import { FakeSpeechSynthesizer } from '../../src/fakes/fakeSynthesizer';
 
@@ -43,14 +44,20 @@ describe('error paths', () => {
     control.close();
   });
 
-  it('surfaces a TTS failure without killing the call', async () => {
+  it('surfaces a TTS failure, plays the fallback phrase, and keeps the call alive', async () => {
     gw = await startGateway({ script: [{ pauseMs: 200 }], synthesizer: new FlakySynthesizer() });
     const control = await activeCall();
 
     control.send({ type: 'say', id: 'boom', text: 'this will fail' });
     const error = await control.waitFor((m) => m.type === 'error' && m.code === 'tts_failed');
     expect(error).toMatchObject({ message: 'upstream TTS 500' });
-    await control.waitFor((m) => m.type === 'say.aborted' && m.id === 'boom');
+    // The failed say is replaced by the canned "out of tokens" clip, so the
+    // callee hears something and the say completes normally.
+    await control.waitFor((m) => m.type === 'say.started' && m.id === 'boom');
+    await control.waitFor((m) => m.type === 'say.completed' && m.id === 'boom');
+    const outboundBytes = gw.twilioApi.mediaClients[0]!.capturedOutbound.reduce((n, f) => n + f.length, 0);
+    expect(outboundBytes / 8).toBeGreaterThanOrEqual(ttsFallbackClip().length / 8);
+    expect(control.events.some((m) => m.type === 'say.aborted')).toBe(false);
 
     // The call is still alive and the next say works.
     control.send({ type: 'say', id: 'retry', text: 'works now' });

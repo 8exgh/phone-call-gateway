@@ -8,6 +8,7 @@ import type { SpeechSynthesizer } from '../speech/synthesizer';
 import type { TranscriberFactory, TranscriberSession } from '../speech/transcriber';
 import type { TwilioApi } from '../telephony/twilioApi';
 import { generateDtmf } from '../audio/dtmf';
+import { ttsFallbackClip } from '../speech/ttsFallbackClip';
 import type {
   CallState,
   ClientMessage,
@@ -304,6 +305,7 @@ export class CallSession {
   private async playSay(say: SayMessage): Promise<void> {
     const abort = new AbortController();
     this.currentSay = { id: say.id, abort };
+    let started = false;
     try {
       const stream = this.deps.synthesizer.synthesize(say.text, {
         voice: say.voice ?? this.deps.defaultVoice,
@@ -314,7 +316,6 @@ export class CallSession {
       // Streaming decimator carries filter state across the arbitrary-size
       // 24kHz chunks, so there are no seams between them.
       const downsampler = new StreamingDownsampler24kTo8k();
-      let started = false;
       // Hold the first PREBUFFER_FRAMES before releasing anything, so a TTS
       // generation stall at utterance start cannot leave playback running dry.
       let prebuffer: Uint8Array[] | null = [];
@@ -343,14 +344,20 @@ export class CallSession {
         if (prebuffer) for (const buffered of prebuffer) this.writeOutboundFrame(buffered);
         if (!prebuffer && tail) this.writeOutboundFrame(tail);
         if (!started) this.emit({ type: 'say.started', id: say.id });
-        const markName = `say-${say.id}`;
-        this.pendingMarks.set(markName, say.id);
-        this.mediaSocket?.sendMark(markName);
+        this.markEndOfSay(say.id);
       }
     } catch (error) {
       if (!abort.signal.aborted) {
         this.emit({ type: 'error', code: 'tts_failed', message: (error as Error).message });
-        this.emit({ type: 'say.aborted', id: say.id, reason: 'error' });
+        // The provider could not speak (e.g. OpenAI 429 spend limit). Rather
+        // than leave the callee on a silent line, play the pre-rendered
+        // fallback phrase under the same say id: it needs no provider, and the
+        // client sees the usual say.started / say.completed lifecycle.
+        if (this.state === 'active' && this.mediaSocket) {
+          this.playMulawClip(say.id, ttsFallbackClip(), { started });
+        } else {
+          this.emit({ type: 'say.aborted', id: say.id, reason: 'error' });
+        }
       }
     } finally {
       this.currentSay = null;
@@ -363,14 +370,23 @@ export class CallSession {
    * echo gate's peak accounting.
    */
   private playDigits(msg: SendDigitsMessage): void {
+    this.playMulawClip(msg.id, mulawEncode(generateDtmf(msg.digits)));
+  }
+
+  /** Write ready-made 8kHz mu-law audio into the call as one say, with the usual lifecycle events. */
+  private playMulawClip(sayId: string, mulawBytes: Uint8Array, opts: { started?: boolean } = {}): void {
     const chunker = new FrameChunker(MULAW_FRAME_BYTES, MULAW_SILENCE);
-    const mulawBytes = mulawEncode(generateDtmf(msg.digits));
-    this.emit({ type: 'say.started', id: msg.id });
+    if (!opts.started) this.emit({ type: 'say.started', id: sayId });
     for (const frame of chunker.push(mulawBytes)) this.writeOutboundFrame(frame);
     const tail = chunker.flush();
     if (tail) this.writeOutboundFrame(tail);
-    const markName = `say-${msg.id}`;
-    this.pendingMarks.set(markName, msg.id);
+    this.markEndOfSay(sayId);
+  }
+
+  /** Ask Twilio to tell us when everything written for this say has played (-> say.completed). */
+  private markEndOfSay(sayId: string): void {
+    const markName = `say-${sayId}`;
+    this.pendingMarks.set(markName, sayId);
     this.mediaSocket?.sendMark(markName);
   }
 

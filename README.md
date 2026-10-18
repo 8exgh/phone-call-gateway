@@ -159,6 +159,11 @@ Server → client:
 { "type": "error", "code": "invalid_message|call_failed|tts_failed|stt_failed|control_busy|unknown_call", "message": "..." }
 ```
 
+On `tts_failed` the say is not dropped: the gateway plays a pre-rendered
+"Out of OpenAI tokens." clip (`src/speech/ttsFallbackClip.ts`, regenerate with
+`scripts/render-tts-fallback.sh`) under the same say id, so the callee hears
+why the line went quiet and the usual `say.completed` follows.
+
 Schemas live in `src/protocol/messages.ts` (zod; single source of truth for server,
 orchestrator, and tests). One control client per call; connecting early replays buffered
 lifecycle events.

@@ -6,12 +6,15 @@ import {
   type TranscriptMessage,
 } from '../protocol/messages';
 import type { ChatClient, ChatMessage, ToolCallRequest, ToolDef } from './chatClient';
+import { TTS_FALLBACK_TEXT } from '../speech/ttsFallbackClip';
 
 /** When the LLM's reply contains this marker, the call is ended after speaking. */
 export const HANGUP_MARKER = 'HANGUP';
 
 /** After an LLM failure the apology is spoken and the call hung up; if it cannot be spoken, hang up anyway. */
 const LLM_FAILURE_HANGUP_MS = 10_000;
+/** After a TTS failure the gateway plays its canned fallback phrase; hang up once it has, or after this long regardless. */
+const TTS_FAILURE_HANGUP_MS = 10_000;
 
 export interface OrchestratorOptions {
   /** ws:// URL of the gateway's control socket for the call. */
@@ -177,8 +180,10 @@ export class Orchestrator {
   private hangupAfterSayId: string | null = null;
   private silenceTimer: NodeJS.Timeout | null = null;
   private finished = false;
-  /** First fatal LLM error; turns the final state into 'failed' with this reason. */
+  /** First fatal LLM/TTS error; turns the final state into 'failed' with this reason. */
   private fatalError: string | null = null;
+  /** Set after a TTS failure: hang up as soon as nothing is left playing. */
+  private hangupWhenIdle = false;
   /** Bumped on every barge-in; says from an older generation are stale. */
   private bargeInGeneration = 0;
   private dtmfBuffer = '';
@@ -340,7 +345,7 @@ export class Orchestrator {
         break;
       case 'say.completed':
         this.saysInFlight.delete(msg.id);
-        if (this.hangupAfterSayId === msg.id) {
+        if (this.hangupAfterSayId === msg.id || this.idleAfterFailure()) {
           this.send({ type: 'hangup' });
         } else if (this.saysInFlight.size === 0) {
           this.armSilenceTimer();
@@ -348,7 +353,10 @@ export class Orchestrator {
         break;
       case 'say.aborted':
         this.saysInFlight.delete(msg.id);
-        if (this.hangupAfterSayId === msg.id) this.send({ type: 'hangup' });
+        if (this.hangupAfterSayId === msg.id || this.idleAfterFailure()) this.send({ type: 'hangup' });
+        break;
+      case 'error':
+        if (msg.code === 'tts_failed') this.onSpeechFailure(msg.message);
         break;
       default:
         break;
@@ -445,6 +453,32 @@ export class Orchestrator {
     } finally {
       this.llmBusy = false;
     }
+  }
+
+  /**
+   * Speech synthesis failed (e.g. OpenAI 429 spend limit, 2026-10-11): what we
+   * meant to say never reached the callee. The gateway plays its pre-rendered
+   * fallback phrase in place of the failed say; once that has played (or if it
+   * cannot), hang up and report the call as failed instead of "ended" so the
+   * caller's system knows the message was not delivered.
+   */
+  private onSpeechFailure(message: string): void {
+    if (this.finished || this.hangupWhenIdle) return;
+    if (this.fatalError === null) this.fatalError = `tts_failed: ${message}`.slice(0, 500);
+    this.hangupWhenIdle = true;
+    this.turns.push({ role: 'agent', text: TTS_FALLBACK_TEXT });
+    if (this.saysInFlight.size === 0) {
+      this.send({ type: 'hangup' });
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (!this.finished) this.send({ type: 'hangup' });
+    }, TTS_FAILURE_HANGUP_MS);
+    timer.unref();
+  }
+
+  private idleAfterFailure(): boolean {
+    return this.hangupWhenIdle && this.saysInFlight.size === 0;
   }
 
   private onLlmFailure(error: unknown): void {
