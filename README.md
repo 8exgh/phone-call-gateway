@@ -124,10 +124,109 @@ Caller [volume: whisper, pace: normal]: okay... fine. that sounds reasonable.
   `followUpDelivered: false`) is re-pinged every 5 minutes for 72 hours until the endpoint
   answers 2xx — same `notificationId`, so receivers dedupe. `POST /orchestrations/:id/notify`
   re-sends it on demand and returns the outcome.
+- REST — voices: `GET /voices` lists the voices an agent can speak with, each described by
+  `gender` (female / male / neutral), `accent`, `age` and a few adjectives, with a
+  `previewUrl` to listen to; filter with `?gender=female&accent=british&search=calm`.
+  `GET /voices/:id/preview` returns a short spoken sample as it sounds on a phone line (WAV).
+  Use a voice by passing its `id` as `voice` on `POST /orchestrations` or
+  `POST /inbound-config`, or make it the default for all of a client's calls with
+  `POST /voice-config {voice}` (`GET` shows it, `DELETE` clears it). Order of precedence:
+  the call's own `voice`, the inbound persona's, the client default, the server default
+  (`REALTIME_VOICE`). An unknown name never fails a call: it falls back to the default and
+  the response says so in `warnings`.
+
+  Two families of voices are listed. The ten built-in ones (`marin`, `cedar`, …) are the
+  speech model's own. With `ELEVENLABS_API_KEY` set, ElevenLabs voices are listed too, with
+  ids of the form `elevenlabs:<voice_id>` and far more accents: the account's own voices
+  always, and on a paid ElevenLabs plan the public voice library, searched live with the
+  same filters (`?accent=irish&gender=female`). ElevenLabs does not let free accounts use
+  library voices over the API; the response's `notes` say so when that applies. For an
+  ElevenLabs voice the model writes its reply as text and ElevenLabs speaks it as it is
+  written; measured reply times are the same as for the built-in voices.
+
+  ```bash
+  curl "$GW/voices?gender=male"                       # browse
+  curl "$GW/voices/cedar/preview" -o cedar.wav        # listen
+  curl -X POST $GW/voice-config -H 'content-type: application/json' -d '{"voice":"cedar"}'
+  ```
 - Twilio reaches `/twilio/media/:callId` via bidirectional Media Streams
   (`<Connect><Stream>`); the orchestrator connects to `/control/:callId`.
 - **Media clock**: all prosody timestamps are Twilio frame count × 20ms — never wall
   clock — so results are deterministic and mock runs can go faster than realtime.
+
+## Voice engines
+
+`VOICE_ENGINE` chooses how server-run conversations (`POST /orchestrations`, incoming calls)
+hear and speak:
+
+- **`realtime`** — the caller's audio goes straight into a speech-to-speech model
+  (`REALTIME_MODEL`, default `gpt-realtime-1.5`) and the model's voice comes straight back,
+  as 8kHz μ-law in both directions with no resampling. The gateway itself decides
+  turn-taking (`src/realtime/realtimeAgent.ts`), because the model's built-in detectors wait
+  about 0.8s before answering:
+  - **Speculative replies.** 140ms after the caller goes quiet the model is asked for its
+    answer; if the caller carries on, the answer is dropped unheard and the whole turn so far
+    is given to the model again as one piece of audio.
+  - **Patience.** A prepared answer is spoken only after the caller has been silent for
+    700ms, more for callers who are seen to pause longer mid-sentence (up to 1s) and after a
+    one- or two-word utterance ("okay", "hi"), which usually has more coming.
+  - **Mid-thought holds.** The model can call `keep_listening` instead of speaking when the
+    caller has clearly not finished ("my number is…"); a trailing "um" or "and" in the
+    transcript is a backstop. After 2.5s of nothing more it answers anyway.
+  - **Interruptions.** 140ms of caller sound over the agent pauses it at once, and a
+    streaming transcriber (`gpt-live-transcribe`, fed only while the agent talks) reports
+    the caller's first word about half a second in. A listening noise ("mm-hmm", "uh-huh",
+    "yeah") and the agent carries straight on from the last gap between words; a real word
+    (even a lone "Wait.") or 0.7s of continued talking and it stops for good, and the model
+    is told how much of its reply was actually heard. A "yeah" or "okay" said over the
+    agent is kept and answered once the agent has finished its sentence.
+  - **Echo.** Some lines (speakerphones) send the agent's own voice back. The agent
+    measures how much comes back during its first seconds of speech and ignores inbound
+    sound below that level; on a line with no echo nothing the caller says is filtered.
+  - **Greetings** and other exact lines are generated before the line connects and cached
+    per voice, so from the second call on a persona's hello starts the moment the call is
+    answered.
+  - The model ends calls with an `end_call` tool, presses keys with `press_keys`, and uses
+    the client's tools exactly as before (hold line, `/respond`, callback promise).
+  - `VOICE_TUNING` overrides any timing as JSON, e.g. `{"patienceMinMs":800}` (see
+    `TurnTuning`). `REALTIME_REASONING` sets reasoning effort for models that reason.
+- **`classic`** (default until switched) — transcribe → chat model → text-to-speech, one
+  sentence at a time, driven over the control WebSocket. Still what `POST /calls` clients
+  use when they run their own conversation loop.
+
+### Measuring how a call feels (`rig/`)
+
+`rig/` is a test rig that grades the caller's experience, not the code:
+
+- `rig/run.ts` places **real phone calls** between two Twilio numbers. One is answered by a
+  local gateway (through a temporary tunnel), the other is a scripted robot caller that plays
+  human-paced speech, records both sides on one clock, and measures what a caller would
+  hear: the gap before each reply, whether the agent talks over a mid-sentence pause, how
+  fast it stops when interrupted, whether "mm-hmm" derails it, stalls, and whether the task
+  got done. `rig/judge.ts` then has an audio model listen to the recordings and rate them.
+- `rig/sim.ts` runs the same agent and the same caller scripts in-process with a simulated
+  phone path (no Twilio), several calls at once: about a minute for the whole suite. Use it
+  to iterate; confirm on the phone.
+- `rig/floor.ts` measures the phone path alone (beep-to-beep, no gateway): about 620ms round
+  trip in this setup, which is part of every reply gap a caller hears and which the gateway
+  cannot remove.
+
+```bash
+rig/session.sh up                                   # tunnels + local gateway + test numbers
+VOICE_ENGINE=realtime rig/session.sh gateway        # (re)start the gateway under test
+node --import tsx rig/run.ts --label mychange --n 3 # 18 real calls, graded scorecard
+node --import tsx rig/judge.ts --dir rig/out/<run>  # listener ratings
+node --import tsx rig/sim.ts --label try --n 2      # the fast loop, no phone
+node --import tsx rig/rescore.ts rig/out/<run>      # re-grade saved recordings with the current analysis
+rig/session.sh down
+```
+
+Reading a scorecard: the timings are "as heard" by the caller, so they include the phone
+path. A call whose line added over half a second more than usual (a network fault between
+gateway and caller, visible as the gap between what the gateway logged and what the caller
+heard) is counted in a "left out" row rather than mixed into the timings. Pass
+`--voice elevenlabs:<voice_id>` to `rig/run.ts`, or set `REALTIME_VOICE` for `rig/sim.ts`,
+to grade a particular voice.
 
 ## Control WebSocket protocol
 

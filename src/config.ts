@@ -21,6 +21,21 @@ const envSchema = z.object({
    */
   TRANSCRIBE_SILENCE_MS: z.coerce.number().int().min(150).max(2000).default(450),
   CHAT_MODEL: z.string().default('gpt-4o-mini'),
+  /**
+   * classic: transcribe -> chat model -> text-to-speech, one sentence at a time.
+   * realtime: caller audio straight into a speech-to-speech model and its
+   * voice straight back, with the gateway deciding turn-taking (much faster).
+   */
+  VOICE_ENGINE: z.enum(['classic', 'realtime']).default('classic'),
+  REALTIME_MODEL: z.string().default('gpt-realtime-1.5'),
+  /** Reasoning effort for realtime models that reason (gpt-realtime-2.x): minimal is fastest. Empty = model default. */
+  REALTIME_REASONING: z.string().optional(),
+  REALTIME_VOICE: z.string().default('marin'),
+  /** Enables ElevenLabs voices (ids "elevenlabs:<voice_id>") for the realtime engine. */
+  ELEVENLABS_API_KEY: z.string().optional(),
+  ELEVENLABS_MODEL: z.string().default('eleven_flash_v2_5'),
+  /** JSON object overriding turn-taking timings (see TurnTuning), e.g. {"speculateAfterMs":160}. */
+  VOICE_TUNING: z.string().optional(),
   /** Standing goal for answering incoming calls; empty = reject incoming calls. */
   INBOUND_GOAL: z.string().optional(),
   INBOUND_OPENING_LINE: z.string().optional(),
@@ -33,6 +48,25 @@ const envSchema = z.object({
   /** Where durable state (client registry) lives; mount a volume here. */
   DATA_DIR: z.string().default('./data'),
 });
+
+function parseTuning(raw: string | undefined): Record<string, number> | undefined {
+  if (!raw || !raw.trim()) return undefined;
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    throw new Error('VOICE_TUNING must be a JSON object of numbers');
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('VOICE_TUNING must be a JSON object of numbers');
+  }
+  const out: Record<string, number> = {};
+  for (const [key, v] of Object.entries(value)) {
+    if (typeof v !== 'number' || !Number.isFinite(v)) throw new Error(`VOICE_TUNING.${key} must be a number`);
+    out[key] = v;
+  }
+  return out;
+}
 
 export interface AppConfig {
   mode: 'mock' | 'live';
@@ -56,6 +90,14 @@ export interface AppConfig {
   adminApiKey?: string;
   dataDir: string;
   chatModel: string;
+  voiceEngine: 'classic' | 'realtime';
+  realtimeModel: string;
+  realtimeReasoning?: string;
+  realtimeVoice: string;
+  elevenLabsApiKey?: string;
+  elevenLabsModel: string;
+  /** Turn-taking overrides for the realtime engine. */
+  voiceTuning?: Record<string, number>;
 }
 
 /**
@@ -105,5 +147,12 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     adminApiKey: parsed.ADMIN_API_KEY || undefined,
     dataDir: parsed.DATA_DIR,
     chatModel: parsed.CHAT_MODEL,
+    voiceEngine: parsed.VOICE_ENGINE,
+    realtimeModel: parsed.REALTIME_MODEL,
+    realtimeReasoning: parsed.REALTIME_REASONING || undefined,
+    realtimeVoice: parsed.REALTIME_VOICE,
+    elevenLabsApiKey: parsed.ELEVENLABS_API_KEY || undefined,
+    elevenLabsModel: parsed.ELEVENLABS_MODEL,
+    voiceTuning: parseTuning(parsed.VOICE_TUNING),
   };
 }

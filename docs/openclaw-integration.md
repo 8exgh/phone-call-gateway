@@ -98,8 +98,31 @@ Fields: `to` (E.164, required), `goal` (what the voice agent should achieve),
 `openingLine` (optional fixed first sentence; omit to let the LLM open), `awaitGreeting`,
 `silenceTimeoutMs` and `promptOnUnclearSpeech` (opt-in manners for business lines; see the
 README),
-`voice` (optional OpenAI TTS voice), `from` (optional; defaults to the
-gateway's configured number, currently +15877417105).
+`voice` (optional: the `id` of a voice from `GET /voices`; see "Choosing a voice"),
+`from` (optional; defaults to the gateway's configured number, currently +15877417105).
+
+### Choosing a voice
+
+`GET /voices` lists the voices the agent can speak with. Each entry has an `id`, a
+`gender` (`female`, `male` or `neutral`), an `accent`, an `age`, a short `description`
+and a `previewUrl`. Narrow the list with query parameters, e.g.
+`GET /voices?gender=female`, `GET /voices?accent=british`, `GET /voices?search=calm`.
+`GET /voices/<id>/preview` plays a few seconds of that voice. Ids are either a plain
+name (`marin`, `cedar`: the speech model's own voices) or `elevenlabs:<id>` (ElevenLabs
+voices, which cover many more accents). If the response has a `notes` array, read it:
+it says when part of the catalog is unavailable and why.
+
+Three ways to use a voice, most specific first:
+
+1. Per call: `"voice": "<id>"` in the `POST /orchestrations` body.
+2. For incoming calls: `"voice": "<id>"` in the `POST /inbound-config` body.
+3. As your default for every call in both directions:
+   `POST /voice-config {"voice": "<id>"}`. `GET /voice-config` shows the current
+   default, `DELETE /voice-config` goes back to the server's.
+
+An id the gateway does not know never fails the call: the default voice is used and
+the `202` response carries a `warnings` entry saying so. The response always includes
+the `voice` actually used.
 
 Immediate `202` response:
 
