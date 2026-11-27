@@ -29,6 +29,8 @@ export interface ClientRecord {
   phoneNumber?: string;
   numberSid?: string;
   inbound?: InboundPolicy | null;
+  /** Default voice for this client's calls (an id from GET /voices). */
+  voice?: string;
   /** Webhook the gateway pings when this client's calls need attention. */
   notifyUrl?: string;
   /** Extra headers for notify pings (e.g. the receiver's auth token). */
@@ -85,7 +87,7 @@ export class ClientStore {
         for (const [key, value] of Object.entries(patch)) {
           if (
             value === null &&
-            (key === 'phoneNumber' || key === 'numberSid' || key === 'notifyUrl' || key === 'notifyHeaders')
+            (key === 'phoneNumber' || key === 'numberSid' || key === 'notifyUrl' || key === 'notifyHeaders' || key === 'voice')
           ) {
             delete (record as unknown as Record<string, unknown>)[key];
           } else {

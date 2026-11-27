@@ -11,6 +11,10 @@ import { LiveTwilioApi } from './telephony/liveTwilioApi';
 import { OpenAiSpeechSynthesizer } from './speech/openAiSynthesizer';
 import { OpenAiTranscriberFactory } from './speech/openAiTranscriber';
 import { OpenAiChatClient } from './orchestrator/openAiChatClient';
+import { openAiRealtimeSocketFactory } from './realtime/realtimeSocket';
+import { elevenLabsTtsFactory } from './speech/elevenLabsTts';
+import { openAiWordSpotterFactory } from './realtime/wordSpotter';
+import { ElevenLabsVoices } from './voices/elevenLabsVoices';
 
 export function buildDeps(config: AppConfig, opts: { framePacingMs?: number } = {}): ServerDeps {
   if (config.mode === 'live') {
@@ -30,6 +34,29 @@ export function buildDeps(config: AppConfig, opts: { framePacingMs?: number } = 
         config.transcribeSilenceMs,
       ),
       chatClientFactory: () => new OpenAiChatClient(config.openAiApiKey!, config.chatModel),
+      ...(config.voiceEngine === 'realtime'
+        ? {
+            realtime: {
+              socketFactory: openAiRealtimeSocketFactory(config.openAiApiKey!),
+              model: config.realtimeModel,
+              reasoningEffort: config.realtimeReasoning,
+              voice: config.realtimeVoice,
+              language: config.transcribeLanguage || undefined,
+              tuning: config.voiceTuning,
+              wordSpotterFactory: openAiWordSpotterFactory(config.openAiApiKey!, 'gpt-live-transcribe', config.transcribeLanguage),
+              ...(config.elevenLabsApiKey
+                ? {
+                    ttsFactories: {
+                      elevenlabs: elevenLabsTtsFactory({ apiKey: config.elevenLabsApiKey, model: config.elevenLabsModel }),
+                    },
+                  }
+                : {}),
+            },
+          }
+        : {}),
+      ...(config.voiceEngine === 'realtime' && config.elevenLabsApiKey
+        ? { voiceSources: [new ElevenLabsVoices(config.elevenLabsApiKey)] }
+        : {}),
       // Signature validation needs the account auth token; with API-key-only
       // auth the webhook is accepted unverified.
       webhookValidator: config.twilioAuthToken

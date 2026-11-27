@@ -48,6 +48,23 @@ const PREBUFFER_FRAMES = 10; // 200ms
 const SILENT_8K_FRAME = new Int16Array(MULAW_FRAME_BYTES);
 
 /**
+ * A voice agent that takes over a call's audio directly: raw 8kHz mu-law
+ * frames in, raw frames out, no say queue and no separate transcriber. Used by
+ * the realtime engine, which does its own listening, turn-taking and speaking.
+ */
+export interface MediaTap {
+  /** The media stream is connected: audio can flow. */
+  onStart(): void;
+  /** One inbound 20ms mu-law frame (160 bytes). */
+  onFrame(mulaw: Uint8Array): void;
+  /** Twilio played everything written before this mark. */
+  onMark(name: string): void;
+  onDtmf(digit: string): void;
+  /** The call is over (hung up, dropped, or failed). */
+  onClosed(state: 'ended' | 'failed', reason?: string): void;
+}
+
+/**
  * State machine for one call, tying together the Twilio media socket, the
  * control socket, TTS, STT, and prosody analysis.
  *
@@ -63,6 +80,8 @@ export class CallSession {
   private mediaSocket: MediaSocket | null = null;
   private controlSend: ((msg: ServerMessage) => void) | null = null;
   private eventBuffer: ServerMessage[] = [];
+
+  private tap: MediaTap | null = null;
 
   private readonly analyzer = new ProsodyAnalyzer();
   private readonly inboundUpsampler = new StreamingUpsampler8kTo24k();
@@ -112,6 +131,31 @@ export class CallSession {
   private setState(state: CallState, reason?: string): void {
     this.state = state;
     this.emit({ type: 'call.state', callId: this.callId, state, ...(reason ? { reason } : {}) });
+    if (state === 'ended' || state === 'failed') this.tap?.onClosed(state, reason);
+  }
+
+  // ---------- direct media (realtime engine) ----------
+
+  /** Hand this call's audio to an in-process voice agent instead of the say/transcribe pipeline. */
+  attachTap(tap: MediaTap): void {
+    this.tap = tap;
+    if (this.state === 'active' && this.mediaSocket) tap.onStart();
+    else if (this.state === 'ended' || this.state === 'failed') tap.onClosed(this.state);
+  }
+
+  /** Tap output: play one mu-law frame into the call. */
+  tapWrite(frame: Uint8Array): void {
+    this.mediaSocket?.writeMediaFrame(frame);
+  }
+
+  /** Tap output: ask Twilio to report (onMark) when everything written so far has played. */
+  tapMark(name: string): void {
+    this.mediaSocket?.sendMark(name);
+  }
+
+  /** Tap output: drop everything Twilio has buffered but not yet played. */
+  tapClear(): void {
+    this.mediaSocket?.sendClear();
   }
 
   private teardown(): void {
@@ -176,7 +220,10 @@ export class CallSession {
       onStart: (_streamSid, providerCallSid) => this.onMediaStart(providerCallSid),
       onMedia: (payloadB64) => this.onMediaFrame(payloadB64),
       onMark: (name) => this.onMediaMark(name),
-      onDtmf: (digit) => this.emit({ type: 'dtmf', digit, atMs: this.mediaClockMs }),
+      onDtmf: (digit) => {
+        this.emit({ type: 'dtmf', digit, atMs: this.mediaClockMs });
+        this.tap?.onDtmf(digit);
+      },
       onStop: () => this.onMediaStop(),
       onClose: () => this.onMediaClose(),
     });
@@ -186,6 +233,10 @@ export class CallSession {
     if (providerCallSid) this.providerCallSid = providerCallSid;
     if (this.state === 'created' || this.state === 'dialing') {
       this.setState('active');
+    }
+    if (this.tap) {
+      this.tap.onStart();
+      return;
     }
     void this.initTranscriber();
     void this.processSayQueue();
@@ -234,6 +285,12 @@ export class CallSession {
   }
 
   private onMediaFrame(payloadB64: string): void {
+    if (this.tap) {
+      const frame = fromBase64(payloadB64);
+      this.mediaClockMs += frame.length / (TELEPHONY_SAMPLE_RATE / 1000);
+      this.tap.onFrame(frame);
+      return;
+    }
     const decoded = mulawDecode(fromBase64(payloadB64));
     const frameStartMs = this.mediaClockMs;
     this.mediaClockMs += decoded.length / (TELEPHONY_SAMPLE_RATE / 1000);
@@ -263,6 +320,10 @@ export class CallSession {
   }
 
   private onMediaMark(name: string): void {
+    if (this.tap) {
+      this.tap.onMark(name);
+      return;
+    }
     const sayId = this.pendingMarks.get(name);
     if (sayId === undefined) return;
     this.pendingMarks.delete(name);

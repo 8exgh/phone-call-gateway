@@ -17,7 +17,14 @@ import { CallSession } from './call/callSession';
 import { handleControlConnection } from './call/controlSocket';
 import { Orchestrator, type ConversationTurn } from './orchestrator/orchestrator';
 import type { ServerMessage } from './protocol/messages';
-import type { ChatClient } from './orchestrator/chatClient';
+import type { ChatClient, ToolCallRequest } from './orchestrator/chatClient';
+import { RealtimeAgent, type TurnTuning } from './realtime/realtimeAgent';
+import type { RealtimeSocketFactory } from './realtime/realtimeSocket';
+import { renderLine } from './realtime/renderLine';
+import { VoiceCatalog, type VoiceSource } from './voices/catalog';
+import type { TtsStream, TtsStreamFactory } from './speech/ttsStream';
+import type { WordSpotterFactory } from './realtime/wordSpotter';
+import { mulawToWav } from './audio/wav';
 import type { SpeechSynthesizer } from './speech/synthesizer';
 import type { TranscriberFactory } from './speech/transcriber';
 import type { PurchasedNumber, TwilioApi } from './telephony/twilioApi';
@@ -28,6 +35,28 @@ export interface ServerDeps {
   transcriberFactory: TranscriberFactory;
   /** One chat client per server-run orchestration (POST /orchestrations). */
   chatClientFactory: () => ChatClient;
+  /**
+   * Realtime voice engine: when present, server-run conversations talk to a
+   * speech-to-speech model directly (caller audio in, agent audio out) instead
+   * of the transcribe -> chat -> synthesize pipeline.
+   */
+  realtime?: {
+    socketFactory: RealtimeSocketFactory;
+    model: string;
+    reasoningEffort?: string;
+    voice: string;
+    language?: string;
+    tuning?: Partial<TurnTuning>;
+    /**
+     * Outside voices by provider name ("elevenlabs"). A voice id of the form
+     * "<provider>:<id>" is spoken by that provider instead of the model.
+     */
+    ttsFactories?: Record<string, TtsStreamFactory>;
+    /** Recognises the caller's first words while the agent talks (for interruptions). */
+    wordSpotterFactory?: WordSpotterFactory;
+  };
+  /** Further voice providers for the catalog (e.g. ElevenLabs). */
+  voiceSources?: VoiceSource[];
   /**
    * Twilio webhook signature check (X-Twilio-Signature). When absent, inbound
    * webhooks are accepted unverified (mock mode / no auth token configured).
@@ -162,7 +191,7 @@ const objectOf = (props: Record<string, unknown>, required: string[]): Record<st
  * matching capability, POST the result back). Names are hints, not a rigid
  * API: the fulfiller interprets them with whatever tools it actually has.
  */
-const DEFAULT_TOOLS = [
+export const DEFAULT_TOOLS = [
   {
     name: 'check_calendar',
     description:
@@ -224,6 +253,21 @@ const inboundConfigBodySchema = z.object({
   openingLine: z.string().optional(),
   voice: z.string().optional(),
 });
+
+const voiceConfigBodySchema = z.object({
+  voice: z.string().min(1).max(100),
+});
+
+const voiceListQuerySchema = z.object({
+  gender: z.string().max(20).optional(),
+  accent: z.string().max(40).optional(),
+  provider: z.string().max(20).optional(),
+  search: z.string().max(60).optional(),
+});
+
+/** What a voice says in its preview clip. */
+const VOICE_PREVIEW_LINE =
+  'Hi, thanks for calling. I can help you book an appointment, answer a question, or take a message. What can I do for you today?';
 
 const clientsBodySchema = z.object({
   name: z.string().min(1).max(60),
@@ -616,7 +660,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
   }): OrchestrationRecord => orchestrations.start(opts);
 
   /** Live orchestrator instances, for feeding tool results into running calls. */
-  const runningOrchestrators = new Map<string, Orchestrator>();
+  const runningOrchestrators = new Map<string, { provideToolResult(requestId: string, result: string): boolean }>();
 
   const DEFAULT_RETRY_DELAYS_MS = [2000];
   const DEFAULT_FOLLOW_UP_RETRY_DELAYS_MS = [2000, 10_000, 30_000, 60_000, 120_000];
@@ -770,67 +814,135 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     },
   ): void => {
     const startedAt = Date.now();
-    const orchestrator = new Orchestrator({
-      controlUrl: `${localWsBase()}/control/${record.id}`,
-      chatClient: deps.chatClientFactory(),
-      systemPrompt:
-        record.direction === 'inbound'
-          ? `You are ANSWERING an incoming call from ${record.from}. ${record.goal}`
-          : `Your goal for this call: ${record.goal}`,
-      objective: record.goal,
-      openingLine: opts.openingLine,
-      voice: opts.voice,
-      tools: opts.tools ?? DEFAULT_TOOLS,
-      toolTimeoutMs: config.toolTimeoutMs,
-      onToolRequest: (request) => {
-        orchestrations.toolRequested(record.id, {
-          id: request.id,
-          name: request.name,
-          arguments: request.arguments,
-        });
-        void notifyClient(record.clientId, {
-          event: 'tool.requested',
-          message:
-            `URGENT phone gateway: a LIVE call is holding the line for tool ${request.name}(${request.arguments}). ` +
-            `Execute it with your real capabilities RIGHT NOW (within ~20 seconds), then POST {"requestId": "${request.id}", "result": "<what you found>"} ` +
-            `to $PHONE_GATEWAY_URL/orchestrations/${record.id}/respond with your PHONE_GATEWAY_API_KEY bearer token. See capabilities/phone.md.`,
-          orchestrationId: record.id,
-          requestId: request.id,
-          name: request.name,
-          arguments: request.arguments,
-          respondUrl: `/orchestrations/${record.id}/respond`,
-          statusUrl: `/orchestrations/${record.id}`,
-        });
-      },
-      onToolTimeout: (requestIds) => {
-        orchestrations.followUpPromised(record.id, requestIds);
-        void notifyClient(record.clientId, followUpPayload(record, { requestIds }), {
-          retryDelaysMs: followUpRetryDelays(),
-        });
-      },
-      turnTimeoutMs: opts.silenceTimeoutMs ?? 15_000,
-      awaitGreeting: opts.awaitGreeting,
-      promptOnUnclearSpeech: opts.promptOnUnclearSpeech,
-      onLlmError: (message) => orchestrations.error(record.id, `llm_failed: ${message}`),
-      onEvent: (event) => {
-        // The debug timeline stays in memory while the call runs and is
-        // persisted in one piece with the finished event.
-        if (record.events.length < EVENT_TIMELINE_LIMIT) {
-          record.events.push(`${Date.now() - startedAt}ms ${describeEvent(event)}`);
-        }
-        if (event.type === 'transcript') {
-          const stutter = event.stutter.detected ? ', stuttering' : '';
-          orchestrations.line(
-            record.id,
-            `[${event.volume.class}, ${event.pace.class}${stutter}] ${event.text}`,
-          );
-        } else if (event.type === 'dtmf') {
-          orchestrations.line(record.id, `[key] ${event.digit}`);
-        } else if (event.type === 'error') {
-          orchestrations.error(record.id, `${event.code}: ${event.message}`);
-        }
-      },
-    });
+    const systemPrompt =
+      record.direction === 'inbound'
+        ? `You are ANSWERING an incoming call from ${record.from}. ${record.goal}`
+        : `Your goal for this call: ${record.goal}`;
+    const onToolRequest = (request: ToolCallRequest): void => {
+      orchestrations.toolRequested(record.id, {
+        id: request.id,
+        name: request.name,
+        arguments: request.arguments,
+      });
+      void notifyClient(record.clientId, {
+        event: 'tool.requested',
+        message:
+          `URGENT phone gateway: a LIVE call is holding the line for tool ${request.name}(${request.arguments}). ` +
+          `Execute it with your real capabilities RIGHT NOW (within ~20 seconds), then POST {"requestId": "${request.id}", "result": "<what you found>"} ` +
+          `to $PHONE_GATEWAY_URL/orchestrations/${record.id}/respond with your PHONE_GATEWAY_API_KEY bearer token. See capabilities/phone.md.`,
+        orchestrationId: record.id,
+        requestId: request.id,
+        name: request.name,
+        arguments: request.arguments,
+        respondUrl: `/orchestrations/${record.id}/respond`,
+        statusUrl: `/orchestrations/${record.id}`,
+      });
+    };
+    const onToolTimeout = (requestIds: string[]): void => {
+      orchestrations.followUpPromised(record.id, requestIds);
+      void notifyClient(record.clientId, followUpPayload(record, { requestIds }), {
+        retryDelaysMs: followUpRetryDelays(),
+      });
+    };
+    const session = registry.get(record.id);
+    /** "<provider>:<id>" voices are spoken by that provider's speech engine. */
+    const outsideVoice = (voice: string | undefined): { stream: TtsStream; key: string } | undefined => {
+      const match = /^([a-z0-9]+):(.+)$/i.exec(voice ?? '');
+      const factory = match ? deps.realtime?.ttsFactories?.[match[1]!.toLowerCase()] : undefined;
+      return match && factory ? { stream: factory(match[2]!), key: voice! } : undefined;
+    };
+    const orchestrator =
+      deps.realtime && session
+        ? new RealtimeAgent({
+            session,
+            socketFactory: deps.realtime.socketFactory,
+            model: deps.realtime.model,
+            reasoningEffort: deps.realtime.reasoningEffort,
+            voice: opts.voice,
+            tts: outsideVoice(opts.voice),
+            wordSpotter: deps.realtime.wordSpotterFactory?.(),
+            defaultVoice: deps.realtime.voice,
+            language: deps.realtime.language,
+            tuning: deps.realtime.tuning,
+            systemPrompt,
+            objective: record.goal,
+            openingLine: opts.openingLine,
+            tools: opts.tools ?? DEFAULT_TOOLS,
+            toolTimeoutMs: config.toolTimeoutMs,
+            onToolRequest,
+            onToolTimeout,
+            turnTimeoutMs: opts.silenceTimeoutMs ?? 15_000,
+            awaitGreeting: opts.awaitGreeting,
+            onLlmError: (message) => orchestrations.error(record.id, `llm_failed: ${message}`),
+            onError: (message) => orchestrations.error(record.id, message),
+            onCallerLine: (line) => orchestrations.line(record.id, line),
+            onTimeline: (text) => {
+              if (record.events.length < EVENT_TIMELINE_LIMIT) {
+                record.events.push(`${Date.now() - startedAt}ms ${text}`);
+              }
+            },
+          })
+        : new Orchestrator({
+        controlUrl: `${localWsBase()}/control/${record.id}`,
+        chatClient: deps.chatClientFactory(),
+        systemPrompt:
+          record.direction === 'inbound'
+            ? `You are ANSWERING an incoming call from ${record.from}. ${record.goal}`
+            : `Your goal for this call: ${record.goal}`,
+        objective: record.goal,
+        openingLine: opts.openingLine,
+        voice: opts.voice,
+        tools: opts.tools ?? DEFAULT_TOOLS,
+        toolTimeoutMs: config.toolTimeoutMs,
+        onToolRequest: (request) => {
+          orchestrations.toolRequested(record.id, {
+            id: request.id,
+            name: request.name,
+            arguments: request.arguments,
+          });
+          void notifyClient(record.clientId, {
+            event: 'tool.requested',
+            message:
+              `URGENT phone gateway: a LIVE call is holding the line for tool ${request.name}(${request.arguments}). ` +
+              `Execute it with your real capabilities RIGHT NOW (within ~20 seconds), then POST {"requestId": "${request.id}", "result": "<what you found>"} ` +
+              `to $PHONE_GATEWAY_URL/orchestrations/${record.id}/respond with your PHONE_GATEWAY_API_KEY bearer token. See capabilities/phone.md.`,
+            orchestrationId: record.id,
+            requestId: request.id,
+            name: request.name,
+            arguments: request.arguments,
+            respondUrl: `/orchestrations/${record.id}/respond`,
+            statusUrl: `/orchestrations/${record.id}`,
+          });
+        },
+        onToolTimeout: (requestIds) => {
+          orchestrations.followUpPromised(record.id, requestIds);
+          void notifyClient(record.clientId, followUpPayload(record, { requestIds }), {
+            retryDelaysMs: followUpRetryDelays(),
+          });
+        },
+        turnTimeoutMs: opts.silenceTimeoutMs ?? 15_000,
+        awaitGreeting: opts.awaitGreeting,
+        promptOnUnclearSpeech: opts.promptOnUnclearSpeech,
+        onLlmError: (message) => orchestrations.error(record.id, `llm_failed: ${message}`),
+        onEvent: (event) => {
+          // The debug timeline stays in memory while the call runs and is
+          // persisted in one piece with the finished event.
+          if (record.events.length < EVENT_TIMELINE_LIMIT) {
+            record.events.push(`${Date.now() - startedAt}ms ${describeEvent(event)}`);
+          }
+          if (event.type === 'transcript') {
+            const stutter = event.stutter.detected ? ', stuttering' : '';
+            orchestrations.line(
+              record.id,
+              `[${event.volume.class}, ${event.pace.class}${stutter}] ${event.text}`,
+            );
+          } else if (event.type === 'dtmf') {
+            orchestrations.line(record.id, `[key] ${event.digit}`);
+          } else if (event.type === 'error') {
+            orchestrations.error(record.id, `${event.code}: ${event.message}`);
+          }
+        },
+      });
     runningOrchestrators.set(record.id, orchestrator);
     void orchestrator
       .run()
@@ -903,9 +1015,10 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
       from,
       goal: parsed.data.goal,
     });
+    const spoken = await resolveVoice(parsed.data.voice, record.clientId);
     runOrchestrator(record, {
       openingLine: parsed.data.openingLine,
-      voice: parsed.data.voice,
+      voice: spoken.voice,
       tools: parsed.data.tools,
       awaitGreeting: parsed.data.awaitGreeting,
       silenceTimeoutMs: parsed.data.silenceTimeoutMs,
@@ -918,6 +1031,8 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
       to: record.to,
       from,
       goal: record.goal,
+      voice: spoken.voice,
+      ...(spoken.warning ? { warnings: [spoken.warning] } : {}),
       status: record.status,
       statusUrl: `/orchestrations/${record.id}`,
     });
@@ -1062,10 +1177,120 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     });
     runOrchestrator(record, {
       openingLine: policy.openingLine,
-      voice: policy.voice,
+      voice: (await resolveVoice(policy.voice, owner?.id)).voice,
     });
 
     return buildStreamTwiml(`${wsBase()}/twilio/media/${callId}`);
+  });
+
+  // ---------- voices ----------
+
+  const voices = new VoiceCatalog(deps.voiceSources ?? []);
+  /** Runtime default for callers without a per-client one (admin / open mode). */
+  let defaultVoiceOverride: string | null = null;
+  const previewCache = new Map<string, Buffer>();
+
+  const serverDefaultVoice = (): string => defaultVoiceOverride ?? deps.realtime?.voice ?? config.ttsVoice;
+
+  /**
+   * The voice a call will speak with. An explicit choice wins, then the
+   * client's default, then the server's. An unknown name never fails the call:
+   * it falls back and says so.
+   */
+  const resolveVoice = async (
+    requested: string | undefined,
+    clientId?: string,
+  ): Promise<{ voice: string; warning?: string }> => {
+    const fallback = (clientId ? store.get(clientId)?.voice : undefined) ?? serverDefaultVoice();
+    if (!requested) return { voice: fallback };
+    // The classic engine hands the name straight to the TTS provider, as it always has.
+    if (!deps.realtime) return { voice: voices.get(requested)?.id ?? requested };
+    const known = await voices.find(requested).catch(() => undefined);
+    // A provider voice is only usable when that provider's speech engine is configured.
+    const provider = /^([a-z0-9]+):/i.exec(known?.id ?? '')?.[1]?.toLowerCase();
+    if (known && (!provider || deps.realtime.ttsFactories?.[provider])) return { voice: known.id };
+    return {
+      voice: fallback,
+      warning: `unknown voice "${requested}": using "${fallback}" instead (GET /voices lists the choices)`,
+    };
+  };
+
+  // Browse the voices: filter by gender / accent / provider or free text, then
+  // pass the chosen id as `voice` on a call, a persona, or POST /voice-config.
+  app.get('/voices', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
+    const parsed = voiceListQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid query' });
+    }
+    const [list, everything] = await Promise.all([voices.listAll(parsed.data), voices.listAll()]);
+    const notes = voices.notes();
+    return {
+      count: list.length,
+      default: (await resolveVoice(undefined, auth.kind === 'client' ? auth.client.id : undefined)).voice,
+      filters: voices.facets(everything),
+      ...(notes.length > 0 ? { notes } : {}),
+      voices: list,
+    };
+  });
+
+  // A short spoken sample of one voice, as it sounds on a phone line (WAV).
+  app.get('/voices/:id/preview', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
+    const voice = await voices.find((req.params as { id: string }).id).catch(() => undefined);
+    if (!voice) return reply.code(404).send({ error: 'unknown voice (GET /voices lists the choices)' });
+    // Provider voices come with the provider's own sample.
+    if (voice.provider !== 'openai' && /^https:\/\//.test(voice.previewUrl)) return reply.redirect(voice.previewUrl);
+    if (voice.provider !== 'openai' || !deps.realtime) {
+      return reply.code(501).send({ error: 'previews are not available for this voice on this server' });
+    }
+    let wav = previewCache.get(voice.id);
+    if (!wav) {
+      try {
+        wav = mulawToWav(await renderLine(deps.realtime.socketFactory, deps.realtime.model, voice.id, VOICE_PREVIEW_LINE));
+      } catch (error) {
+        return reply.code(424).send({ error: `could not render preview: ${(error as Error).message}` });
+      }
+      previewCache.set(voice.id, wav);
+    }
+    return reply.type('audio/wav').header('cache-control', 'private, max-age=86400').send(wav);
+  });
+
+  // The default voice for this caller's calls (both directions). A client
+  // token sets its own; the admin key / open mode sets the server-wide default.
+  app.post('/voice-config', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
+    const parsed = voiceConfigBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid body' });
+    }
+    const voice = await voices.find(parsed.data.voice).catch(() => undefined);
+    if (!voice) {
+      return reply.code(400).send({ error: `unknown voice "${parsed.data.voice}" (GET /voices lists the choices)` });
+    }
+    if (auth.kind === 'client') store.update(auth.client.id, { voice: voice.id });
+    else defaultVoiceOverride = voice.id;
+    return { voice };
+  });
+
+  app.get('/voice-config', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
+    const id = (await resolveVoice(undefined, auth.kind === 'client' ? auth.client.id : undefined)).voice;
+    const own = auth.kind === 'client' ? Boolean(auth.client.voice) : defaultVoiceOverride !== null;
+    return { voice: (await voices.find(id).catch(() => undefined)) ?? { id }, source: own ? 'configured' : 'server default' };
+  });
+
+  app.delete('/voice-config', async (req, reply) => {
+    const auth = authenticate(req, reply);
+    if (!auth) return;
+    if (auth.kind === 'client') store.update(auth.client.id, { voice: undefined });
+    else defaultVoiceOverride = null;
+    const id = (await resolveVoice(undefined, auth.kind === 'client' ? auth.client.id : undefined)).voice;
+    return { voice: (await voices.find(id).catch(() => undefined)) ?? { id }, source: 'server default' };
   });
 
   // Where the gateway pings this client when their calls need attention
