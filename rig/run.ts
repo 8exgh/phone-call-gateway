@@ -62,7 +62,7 @@ async function inboundIds(): Promise<string[]> {
 
 async function main(): Promise<void> {
   if (!CALLER_PUBLIC || !AGENT_NUMBER || !CALLER_NUMBER) throw new Error('rig session not up: run rig/session.sh up');
-  const wanted = values.scenario === 'all' ? SCENARIOS : SCENARIOS.filter((s) => values.scenario!.split(',').includes(s.name));
+  const wanted = values.scenario === 'all' ? SCENARIOS.filter((s) => !s.optIn) : SCENARIOS.filter((s) => values.scenario!.split(',').includes(s.name));
   const n = Number(values.n);
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const outDir = join(__dirname, 'out', `${stamp}-${values.label}`);

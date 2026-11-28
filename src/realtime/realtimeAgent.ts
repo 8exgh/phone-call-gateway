@@ -151,6 +151,8 @@ const REASSURE_AFTER_MS = 8000;
 const DEFAULT_TOOL_TIMEOUT_MS = 30_000;
 const MAX_TOOL_ROUNDS = 4;
 const STALL_RETRY_MS = 2500;
+/** After this many prompts in a row with no answer, say goodbye and hang up. */
+const MAX_UNANSWERED_PROMPTS = 2;
 const TTS_SILENT_MS = 6000;
 
 /**
@@ -214,6 +216,8 @@ When you need information or an action you don't have at hand (a calendar, a loo
 Turn-taking: the caller's audio reaches you in pieces, cut at every short pause, so a piece is often only part of what they are saying. Judge the latest piece together with the pieces before it. If they are clearly not finished (the sentence is incomplete, it ends on a filler or connective like "um", "and", "so", "about", "my name is", or they said they need a moment to think), do not speak: call keep_listening so they can go on. Do this every time it applies, however many times in a row. If what they have said is a complete question, answer or statement, reply normally and do not call keep_listening.
 
 Text in [square brackets] is a note from the phone system, not something the caller said; never read it aloud. "[caller pressed keys: ...]" tells you what they dialed. To press keys yourself (automated menus), call press_keys.
+
+If you reach voicemail or an answering machine (a recording that asks you to leave a message, or says the person is unavailable), nobody is listening live: leave one short message saying who is calling and why, then call end_call in the same turn. Do not ask questions or wait for an answer.
 
 When the conversation is over (the caller says goodbye, or the objective is done), say a brief goodbye aloud and call end_call in the same turn. Never call end_call without speaking a goodbye in that same turn.${
     opts.tts
@@ -376,6 +380,8 @@ export class RealtimeAgent implements MediaTap {
   private greetingReply: Reply | null = null;
   private greetingTimer: NodeJS.Timeout | null = null;
   private silenceTimer: NodeJS.Timeout | null = null;
+  /** Times in a row the line stayed silent after we prompted it. */
+  private unansweredPrompts = 0;
   private holdTimer: NodeJS.Timeout | null = null;
   private holding = false;
   private dtmfBuffer = '';
@@ -892,6 +898,7 @@ export class RealtimeAgent implements MediaTap {
 
     this.commitTurn();
     this.toolRounds = 0;
+    this.unansweredPrompts = 0;
     if (this.toolHoldActive) {
       // Their words are in the conversation; the answer comes with the tool result.
       this.pendingCallerInput = true;
@@ -1691,6 +1698,12 @@ export class RealtimeAgent implements MediaTap {
     this.silenceTimer = setTimeout(() => {
       this.silenceTimer = null;
       if (this.finished || this.playing || this.active || !this.pauseHandled) return;
+      if (++this.unansweredPrompts > MAX_UNANSWERED_PROMPTS) {
+        // Nobody is there (a voicemail, a dropped handset): do not keep talking to an empty line.
+        this.note(`line silent after ${MAX_UNANSWERED_PROMPTS} prompts: hanging up`);
+        this.speak("It sounds like you're not there, so I'll hang up now. Goodbye.", { hangupAfter: true });
+        return;
+      }
       this.addNote(
         '[The caller has been silent for a while. Briefly restate where things stand toward the objective, or ask the single next question you need. If the objective is done, say goodbye and call end_call.]',
       );

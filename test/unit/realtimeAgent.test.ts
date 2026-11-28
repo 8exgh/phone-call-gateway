@@ -424,6 +424,43 @@ describe('RealtimeAgent', () => {
     expect(call.line.hungUp).toBe(false);
   });
 
+  it('stops prompting a line that stays silent: two prompts, then goodbye and hang up', () => {
+    const call = startCall({ turnTimeoutMs: 5000 });
+    const prompt = (): void => {
+      call.feed(silence(5100)); // silence timer fires
+      modelAnswers(call.socket, { audioMs: 400, text: 'Are you still there?' });
+      call.feed(silence(100));
+      call.line.ackLastMark();
+    };
+    const before = call.socket.count('response.create');
+    prompt();
+    prompt();
+    expect(call.socket.count('response.create')).toBe(before + 2);
+    call.feed(silence(5100)); // a third silence: no more prompts
+    expect(call.timeline).toContain('line silent after 2 prompts: hanging up');
+    const bye = call.socket.last('response.create') as { response: { instructions: string } };
+    expect(bye.response.instructions).toContain("I'll hang up now");
+    modelAnswers(call.socket, { audioMs: 400 });
+    call.feed(silence(100));
+    call.line.ackLastMark();
+    expect(call.line.hungUp).toBe(true);
+  });
+
+  it('counts unanswered prompts afresh once the caller speaks', () => {
+    const call = startCall({ turnTimeoutMs: 5000 });
+    for (let i = 0; i < 2; i++) {
+      call.feed(silence(5100));
+      modelAnswers(call.socket, { audioMs: 400, text: 'Are you still there?' });
+      call.feed(silence(100));
+      call.line.ackLastMark();
+    }
+    call.exchange(400, 'Good, you are back.');
+    call.line.ackLastMark();
+    call.feed(silence(5100)); // silent again: this is prompt one, not a hangup
+    expect(call.timeline).not.toContain('line silent after 2 prompts: hanging up');
+    expect(call.line.hungUp).toBe(false);
+  });
+
   it('ends the call as failed when the model connection is lost', async () => {
     const errors: string[] = [];
     const call = startCall({ onLlmError: (m) => errors.push(m) });

@@ -24,7 +24,7 @@ dotenv({ path: join(__dirname, '..', '.env'), override: true });
  * truth; this is for fast iteration on turn-taking.
  *
  *   node --import tsx rig/sim.ts --label try --n 2 [--scenario pauses,bargein] [--delay 310]
- *   env: REALTIME_MODEL, REALTIME_REASONING, REALTIME_VOICE, VOICE_TUNING
+ *   env: REALTIME_MODEL, REALTIME_REASONING, REALTIME_VOICE, VOICE_TUNING, SIM_GOAL, SIM_OPENING
  */
 const { values } = parseArgs({
   options: {
@@ -140,9 +140,10 @@ async function runOne(scenario: Scenario, tag: string, outDir: string | null): P
     wordSpotter: process.env.WORD_SPOTTER === '0' ? undefined : openAiWordSpotterFactory(process.env.OPENAI_API_KEY!)(),
     language: 'en',
     tuning: TUNING,
-    systemPrompt: `You are ANSWERING an incoming call from +15878175749. ${PERSONA.goal}`,
-    objective: PERSONA.goal,
-    openingLine: PERSONA.openingLine,
+    // SIM_GOAL / SIM_OPENING stand in for an outbound call's goal and first line.
+    systemPrompt: process.env.SIM_GOAL ? `Your goal for this call: ${process.env.SIM_GOAL}` : `You are ANSWERING an incoming call from +15878175749. ${PERSONA.goal}`,
+    objective: process.env.SIM_GOAL ?? PERSONA.goal,
+    openingLine: process.env.SIM_OPENING ?? PERSONA.openingLine,
     tools: DEFAULT_TOOLS,
     turnTimeoutMs: 15_000,
     onTimeline: (text) => events.push(`${Date.now() - startedAt}ms ${text}`),
@@ -205,7 +206,7 @@ async function runOne(scenario: Scenario, tag: string, outDir: string | null): P
 }
 
 async function main(): Promise<void> {
-  const wanted = values.scenario === 'all' ? SCENARIOS : SCENARIOS.filter((s) => values.scenario!.split(',').includes(s.name));
+  const wanted = values.scenario === 'all' ? SCENARIOS.filter((s) => !s.optIn) : SCENARIOS.filter((s) => values.scenario!.split(',').includes(s.name));
   const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
   const outDir = join(__dirname, 'out', `${stamp}-sim-${values.label}`);
   mkdirSync(outDir, { recursive: true });
