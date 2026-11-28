@@ -134,7 +134,9 @@ export function analyzeCall(input: {
             break;
           }
         }
-        if (stopAt === null || stopAt >= line.endMs) res.ignored = true;
+        // Ignored = still talking well after the caller finished their interruption (a one-word
+        // interruption is over before any agent could react, so allow the reaction time).
+        if (stopAt === null || stopAt >= Math.max(line.endMs, line.startMs + 1500)) res.ignored = true;
         res.stopMs = Math.max(0, (stopAt ?? line.endMs) - line.startMs);
         const reply = segs.find((s) => s.startMs >= Math.max(line.endMs, stopAt ?? 0) && s.startMs < windowEnd);
         if (reply) res.replyGapMs = reply.startMs - line.endMs;

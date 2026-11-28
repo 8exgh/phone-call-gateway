@@ -289,6 +289,40 @@ describe('RealtimeAgent', () => {
     expect(call.socket.count('response.create')).toBe(creates + 1);
   });
 
+  it('overrules the model when it holds on what the transcript shows is a finished question', () => {
+    const call = startCall();
+    call.feed(speech(900));
+    call.feed(silence(160));
+    call.socket.emit({ type: 'input_audio_buffer.committed', item_id: 'user_q' });
+    modelAnswers(call.socket, { calls: [{ name: 'keep_listening' }] });
+    const creates = call.socket.count('response.create');
+    call.socket.emit({
+      type: 'conversation.item.input_audio_transcription.completed',
+      item_id: 'user_q',
+      transcript: 'So is this call from production?',
+    });
+    expect(call.timeline).toContain('hold overruled (they asked a question)');
+    expect(call.socket.count('response.create')).toBe(creates + 1);
+    // if the model insists, it is not overruled a second time for the same turn
+    modelAnswers(call.socket, { calls: [{ name: 'keep_listening' }] });
+    expect(call.socket.count('response.create')).toBe(creates + 1);
+  });
+
+  it('treats what the caller says after a held-then-answered turn as a new turn', () => {
+    const call = startCall();
+    call.feed(speech(900));
+    call.feed(silence(160));
+    call.socket.emit({ type: 'input_audio_buffer.committed', item_id: 'user_h' });
+    modelAnswers(call.socket, { calls: [{ name: 'keep_listening' }] });
+    call.feed(silence(2100)); // hold expires, the model is asked again
+    modelAnswers(call.socket, { audioMs: 400, text: 'Sure.' });
+    call.feed(silence(100));
+    call.line.ackLastMark();
+    call.feed(speech(600)); // a fresh utterance
+    expect(call.timeline.some((t) => t.startsWith('turn continues'))).toBe(false);
+    expect(call.socket.sent).not.toContainEqual({ type: 'conversation.item.delete', item_id: 'user_h' });
+  });
+
   it('holds back a reply when the transcript shows the caller trailed off mid-sentence', () => {
     const call = startCall({ tuning: { patienceMinMs: 1000 } });
     const before = call.line.written.length;
@@ -550,9 +584,28 @@ describe('RealtimeAgent', () => {
       call.exchange(5000);
       call.feed(silence(1000));
       call.feed(speech(300)); // "Wait."
+      const commits = call.socket.count('input_audio_buffer.commit');
+      const creates = call.socket.count('response.create');
+      call.feed(silence(260)); // they said one word and stopped
       ears.hear(' Wait.');
       expect(call.timeline.some((t) => t.startsWith('caller took the floor: "Wait."'))).toBe(true);
       expect(call.socket.count('conversation.item.truncate')).toBe(1);
+      // their one word is their turn: it is put to the model and answered
+      expect(call.socket.count('input_audio_buffer.commit')).toBe(commits + 1);
+      expect(call.socket.count('response.create')).toBe(creates + 1);
+    });
+
+    it('does not pick back up until the first word has had time to arrive', () => {
+      const ears = spotter();
+      const call = startCall({ wordSpotter: ears });
+      call.exchange(5000);
+      call.feed(silence(1000));
+      call.feed(speech(200)); // a sound, then quiet
+      expect(call.line.clears).toBe(1);
+      call.feed(silence(280)); // quiet for 280ms: its word could still be on the way
+      expect(call.timeline.some((t) => t.startsWith('resumed from'))).toBe(false);
+      call.feed(silence(200)); // no word came: carry on
+      expect(call.timeline.some((t) => t.startsWith('resumed from'))).toBe(true);
     });
 
     it('treats "yeah" said over it as an answer once it has finished speaking', () => {
