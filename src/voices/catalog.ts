@@ -51,6 +51,8 @@ export interface VoiceSource {
   readonly provider: string;
   list(filter: VoiceFilter): Promise<VoiceInfo[]>;
   find(id: string): Promise<VoiceInfo | undefined>;
+  /** Make a chosen library voice available to the speech account. Never called when browsing. */
+  prepare?(id: string): Promise<VoiceInfo>;
   /** Things the person choosing should know (a provider is unreachable, a plan limits the list). */
   notes(): string[];
   /** Accents this provider can be searched for beyond those in the listing at hand. */
@@ -88,6 +90,13 @@ export class VoiceCatalog {
     const provider = /^([a-z0-9]+):/i.exec(id.trim())?.[1]?.toLowerCase();
     const source = this.sources.find((s) => s.provider === provider);
     return source ? source.find(id.trim()) : undefined;
+  }
+
+  async prepare(id: string): Promise<VoiceInfo> {
+    const voice = await this.find(id);
+    if (!voice) throw new Error(`unknown voice "${id}" (GET /voices lists the choices)`);
+    const source = this.sources.find((s) => s.provider === voice.provider);
+    return source?.prepare ? source.prepare(voice.id) : voice;
   }
 
   /** Built-in voices only (no network). */

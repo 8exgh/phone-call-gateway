@@ -72,6 +72,7 @@ interface Line {
   dead: boolean;
   queue: string[];
   inFlight: number;
+  failure?: string;
 }
 
 interface Utterance {
@@ -79,6 +80,7 @@ interface Utterance {
   line: Line;
   onAudio: (mulaw: Uint8Array) => void;
   onDone: () => void;
+  onError?: (message: string) => void;
   /** Everything sent for it so far, so it can be said again on a new connection. */
   sent: string[];
   gotAudio: boolean;
@@ -124,10 +126,23 @@ class ElevenLabsStream implements TtsStream {
       line.queue = [];
     });
     socket.on('message', (data: Buffer | string) => {
-      let msg: { audio?: string | null; contextId?: string; context_id?: string; isFinal?: boolean; is_final?: boolean };
+      let msg: { audio?: string | null; contextId?: string; context_id?: string; isFinal?: boolean; is_final?: boolean; error?: unknown; message?: string };
       try {
         msg = JSON.parse(data.toString());
       } catch {
+        return;
+      }
+      if (msg.error) {
+        // Provider errors may have no context ID. Surface them for every
+        // affected utterance instead of retrying a policy rejection in silence.
+        const failure = `ElevenLabs ${String(msg.error)}: ${msg.message ?? 'speech rejected'}`.replaceAll(this.opts.apiKey, '[redacted]').slice(0, 500);
+        const context = msg.contextId ?? msg.context_id;
+        if (!context) line.failure = failure;
+        for (const u of [...this.utterances.values()]) {
+          if (u.line !== line || (context && u.id !== context)) continue;
+          u.onError?.(failure);
+          this.finish(u);
+        }
         return;
       }
       const utterance = this.utterances.get(msg.contextId ?? msg.context_id ?? '');
@@ -156,11 +171,12 @@ class ElevenLabsStream implements TtsStream {
       }
       for (const utterance of [...this.utterances.values()]) {
         if (utterance.line !== line || utterance.finished) continue;
-        if (!utterance.gotAudio && !utterance.retried && !this.closed) {
+        if (!line.failure && !utterance.gotAudio && !utterance.retried && !this.closed) {
           // Nothing was heard yet: say it again on a fresh connection.
           this.resend(utterance);
         } else {
           // Cut off part-way (or failed twice): end it rather than hang the call.
+          utterance.onError?.(line.failure ?? 'ElevenLabs speech connection closed before the utterance completed');
           this.finish(utterance);
         }
       }
@@ -172,7 +188,7 @@ class ElevenLabsStream implements TtsStream {
 
   /** The connection new utterances go to: a fresh one if the current is gone or nearly full. */
   private currentLine(): Line {
-    if (!this.line || this.line.dead || this.line.inFlight >= MAX_IN_FLIGHT) {
+    if (!this.line || this.line.dead || this.line.failure || this.line.inFlight >= MAX_IN_FLIGHT) {
       const old = this.line;
       this.line = this.connect();
       // The old connection finishes what it has and is then closed.
@@ -214,10 +230,10 @@ class ElevenLabsStream implements TtsStream {
     utterance.onDone();
   }
 
-  begin(onAudio: (mulaw: Uint8Array) => void, onDone: () => void): TtsUtterance {
+  begin(onAudio: (mulaw: Uint8Array) => void, onDone: () => void, onError?: (message: string) => void): TtsUtterance {
     const line = this.currentLine();
     line.inFlight++;
-    const utterance: Utterance = { id: `u${++this.seq}`, line, onAudio, onDone, sent: [], gotAudio: false, retried: false, finished: false, watchdog: null };
+    const utterance: Utterance = { id: `u${++this.seq}`, line, onAudio, onDone, onError, sent: [], gotAudio: false, retried: false, finished: false, watchdog: null };
     this.utterances.set(utterance.id, utterance);
     const send = (payload: Record<string, unknown>): void => {
       const message = JSON.stringify({ ...payload, context_id: utterance.id });
@@ -252,12 +268,12 @@ class ElevenLabsStream implements TtsStream {
     };
     return {
       push: (text) => {
-        if (ended) return;
+        if (ended || utterance.finished) return;
         held += text;
         flushReady();
       },
       end: (finalText) => {
-        if (ended) return;
+        if (ended || utterance.finished) return;
         ended = true;
         if (finalText) held += finalText;
         if (held.trim()) {
@@ -276,6 +292,7 @@ class ElevenLabsStream implements TtsStream {
         this.sendOn(utterance.line, JSON.stringify({ context_id: utterance.id, close_context: true }));
         utterance.onAudio = () => {};
         utterance.onDone = () => {};
+        utterance.onError = () => {};
         utterance.retried = true;
         if (utterance.watchdog) clearTimeout(utterance.watchdog);
         utterance.watchdog = null;

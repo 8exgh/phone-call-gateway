@@ -1302,6 +1302,12 @@ export class RealtimeAgent implements MediaTap {
       () => {
         if (!this.finished) this.onAudioDone(reply);
       },
+      (message) => {
+        clearTimeout(silent);
+        if (this.finished || reply.cancelled) return;
+        this.opts.onError?.(`tts_failed: ${message}`);
+        this.fail(`tts_failed: ${message}`);
+      },
     );
   }
 

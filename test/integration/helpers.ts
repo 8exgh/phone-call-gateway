@@ -33,6 +33,7 @@ export async function startGateway(
     webhookValidator?: Parameters<typeof buildServer>[0]['webhookValidator'];
     /** Run server-side conversations on the realtime engine (with a test socket). */
     realtime?: Parameters<typeof buildServer>[0]['realtime'];
+    voiceSources?: Parameters<typeof buildServer>[0]['voiceSources'];
     dryAreaCodes?: string[];
   } = {},
 ): Promise<Gateway> {
@@ -46,6 +47,7 @@ export async function startGateway(
       chatClientFactory: opts.chatClientFactory ?? (() => new FakeChatClient(demoChatScript)),
       webhookValidator: opts.webhookValidator,
       ...(opts.realtime ? { realtime: opts.realtime } : {}),
+      voiceSources: opts.voiceSources,
     },
     // Fresh event-store dir per gateway so tests never share state or touch ./data.
     { ttsVoice: 'alloy', dataDir: mkdtempSync(path.join(tmpdir(), 'pgw-test-')), ...opts.serverConfig },

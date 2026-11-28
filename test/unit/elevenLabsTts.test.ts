@@ -35,6 +35,29 @@ const audio = (context: string): unknown => ({ audio: Buffer.from([1, 2, 3, 4]).
 const final = (context: string): unknown => ({ audio: null, isFinal: true, contextId: context });
 
 describe('ElevenLabs speech stream', () => {
+  it('surfaces a provider rejection without a context ID and does not retry it', () => {
+    const { stream, sockets } = setup();
+    const errors: string[] = [];
+    let done = 0;
+    stream.begin(() => {}, () => done++, (message) => errors.push(message)).end('Hello.');
+    sockets[0]!.fire('message', { error: 'voice_id_does_not_exist', message: 'The selected voice does not exist.' });
+    sockets[0]!.fire('close');
+    expect(errors).toEqual(['ElevenLabs voice_id_does_not_exist: The selected voice does not exist.']);
+    expect(done).toBe(1);
+    expect(sockets).toHaveLength(1);
+    stream.close();
+  });
+
+  it('does not report errors from a cancelled utterance', () => {
+    const { stream, sockets } = setup();
+    const error = jest.fn();
+    const utterance = stream.begin(() => {}, () => {}, error);
+    utterance.end('Hello.');
+    utterance.cancel();
+    sockets[0]!.fire('message', { context_id: 'u1', error: 'cancelled' });
+    expect(error).not.toHaveBeenCalled();
+    stream.close();
+  });
   it('sends the first sentence as soon as it is written, then the rest as one piece', () => {
     const { stream, sockets } = setup();
     const utterance = stream.begin(() => {}, () => {});

@@ -16,7 +16,7 @@ export interface TtsUtterance {
 }
 
 export interface TtsStream {
-  begin(onAudio: (mulaw: Uint8Array) => void, onDone: () => void): TtsUtterance;
+  begin(onAudio: (mulaw: Uint8Array) => void, onDone: () => void, onError?: (message: string) => void): TtsUtterance;
   close(): void;
 }
 

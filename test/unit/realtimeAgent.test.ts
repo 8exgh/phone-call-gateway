@@ -705,5 +705,17 @@ describe('RealtimeAgent', () => {
       const result = await call.end();
       expect(result.finalState).toBe('failed');
     });
+
+    it('records the actual provider rejection immediately', async () => {
+      const rejected: TtsStream = {
+        begin(_audio, _done, error) { return { push() {}, cancel() {}, end() { error?.('ElevenLabs voice_id_does_not_exist'); } }; },
+        close() {},
+      };
+      const errors: string[] = [];
+      const call = startCall({ tts: { stream: rejected, key: 'elevenlabs:unavailable' }, onError: (m) => errors.push(m) });
+      expect(call.line.hungUp).toBe(true);
+      expect(errors).toContain('tts_failed: ElevenLabs voice_id_does_not_exist');
+      expect((await call.end()).reason).toContain('voice_id_does_not_exist');
+    });
   });
 });
