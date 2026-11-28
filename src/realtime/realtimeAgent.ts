@@ -35,6 +35,16 @@ export interface TurnTuning {
   /** After a sound over the agent ends, how long to wait for its words before treating it as noise. */
   wordWaitMs: number;
   /**
+   * A paused agent waits this long after the caller's sound ENDS before picking
+   * back up (sooner if the sound is recognised as a listening noise): a word is
+   * recognised a few hundred ms after it is finished, and resuming just before
+   * "Stop" arrives means talking over the person who said it. Kept short: a
+   * long pause after "uh-huh" makes the caller think the agent has finished.
+   */
+  wordGraceMs: number;
+  /** ...and never sooner than this long after the sound began. */
+  minPauseMs: number;
+  /**
    * Caller speech over the agent before the agent pauses. A pause is not yet an
    * interruption: if the sound turns out to be short ("mm-hmm") the agent
    * picks its sentence back up.
@@ -84,12 +94,14 @@ export const DEFAULT_TUNING: TurnTuning = {
   shortWaitMs: 850,
   burstJoinMs: 1000,
   wordWaitMs: 600,
+  wordGraceMs: 300,
+  minPauseMs: 600,
   pauseMs: 140,
   bargeInMs: 700,
   yieldWindowMs: 700,
   yieldMs: 120,
   backchannelGapMs: 200,
-  holdMaxMs: 2500,
+  holdMaxMs: 2000,
   prerollMs: 300,
   minUtteranceMs: 100,
   echoRatio: 0.25,
@@ -214,6 +226,8 @@ Be relentlessly goal-oriented:
 When you need information or an action you don't have at hand (a calendar, a lookup, a computation, the web, a file), call one of your tools instead of guessing or stalling. If a result cannot arrive during the call, tell the caller you will take care of it right now and call them back immediately, then call end_call.
 
 Turn-taking: the caller's audio reaches you in pieces, cut at every short pause, so a piece is often only part of what they are saying. Judge the latest piece together with the pieces before it. If they are clearly not finished (the sentence is incomplete, it ends on a filler or connective like "um", "and", "so", "about", "my name is", or they said they need a moment to think), do not speak: call keep_listening so they can go on. Do this every time it applies, however many times in a row. If what they have said is a complete question, answer or statement, reply normally and do not call keep_listening.
+
+If the caller cuts you off, they did not want the rest of what you were saying: never pick it back up or repeat it. Respond only to what they said. If all they said was "stop", "wait", "hold on" or the like, say a few words to hand them the floor ("Sure, go ahead.") and nothing more.
 
 Text in [square brackets] is a note from the phone system, not something the caller said; never read it aloud. "[caller pressed keys: ...]" tells you what they dialed. To press keys yourself (automated menus), call press_keys.
 
@@ -359,7 +373,10 @@ export class RealtimeAgent implements MediaTap {
    * A sound the caller is making (or just made) over the agent, while its
    * words are awaited: loudMs across its bursts, what has been recognised.
    */
-  private overlap: { loudMs: number; kind: 'none' | 'hum' | 'agreement' | 'words'; text: string } | null = null;
+  private overlap: { loudMs: number; kind: 'none' | 'hum' | 'agreement' | 'words'; text: string; startedAt: number } | null = null;
+  private resumeTimer: NodeJS.Timeout | null = null;
+  /** The model's "they are mid-thought" was already overruled once for this turn. */
+  private holdOverruled = false;
   private overlapTimer: NodeJS.Timeout | null = null;
   private classifyTimer: NodeJS.Timeout | null = null;
   /** The caller said a word of agreement over the agent ("yeah"): answer it once the agent has finished. */
@@ -520,7 +537,7 @@ export class RealtimeAgent implements MediaTap {
     // Whatever the agent was saying when the line dropped still counts as said.
     if (this.playing) this.recordAgentTurn(this.playing, this.playedFrames(this.playing) * 20);
     this.finished = true;
-    for (const t of [this.greetingTimer, this.silenceTimer, this.holdTimer, this.dtmfTimer, this.releaseTimer, this.overlapTimer, this.classifyTimer]) if (t) clearTimeout(t);
+    for (const t of [this.greetingTimer, this.silenceTimer, this.holdTimer, this.dtmfTimer, this.releaseTimer, this.overlapTimer, this.classifyTimer, this.resumeTimer]) if (t) clearTimeout(t);
     this.opts.wordSpotter?.close();
     this.abortToolWait?.();
     this.socket.close();
@@ -720,14 +737,27 @@ export class RealtimeAgent implements MediaTap {
       if (kind === 'none') return;
       if (kind === 'words') {
         this.note(`caller took the floor: "${overlap.text.trim().slice(0, 60)}"`);
+        // If they have already stopped talking ("Stop." / "Wait."), nothing else
+        // will prompt a reply: what they said is their turn, so answer it.
+        const alreadyQuiet = this.pauseHandled;
         this.interrupt();
+        if (alreadyQuiet && !this.toolHoldActive) {
+          this.commitTurn();
+          this.unansweredSince = this.lastLoudAt;
+          const reply = this.requestTurnReply();
+          if (reply) reply.speechEndAt = this.lastLoudAt;
+        }
         return;
       }
       if (overlap.kind !== kind) {
         this.note(`listening noise over agent ("${overlap.text.trim().slice(0, 40)}"): carrying on`);
         overlap.kind = kind;
       }
-      if (this.playing.paused) this.resumePlayback(this.playing);
+      if (this.playing.paused) {
+        if (this.resumeTimer) clearTimeout(this.resumeTimer);
+        this.resumeTimer = null;
+        this.resumePlayback(this.playing);
+      }
       // If the sound has already stopped there is nothing more to wait for.
       if (this.pauseHandled) this.endOverlap(null);
     }, settle);
@@ -799,7 +829,7 @@ export class RealtimeAgent implements MediaTap {
       (this.playing.paused || Date.now() - this.overlapBurstEndAt < this.tuning.burstJoinMs);
     if (this.playing && this.opts.wordSpotter && !secondBurst) {
       // Their words will say whether this is a listening noise or a bid for the floor.
-      this.overlap ??= { loudMs: 60, kind: 'none', text: '' };
+      this.overlap ??= { loudMs: 60, kind: 'none', text: '', startedAt: Date.now() - 60 };
       if (this.overlapTimer) clearTimeout(this.overlapTimer);
       this.overlapTimer = null;
     }
@@ -849,7 +879,20 @@ export class RealtimeAgent implements MediaTap {
         // The sound has stopped. We carry on, but if its words have not arrived
         // yet they still count for a moment: a lone "Wait." deserves the floor.
         if (this.overlap.kind === 'none') {
-          if (this.playing.paused) this.resumePlayback(this.playing);
+          if (this.playing.paused) {
+            // Their sound has stopped, but its first word may still be on its way.
+            const reply = this.playing;
+            const soundEndedAt = Date.now() - this.vad.silenceMs;
+            const waitMs = Math.max(soundEndedAt + this.tuning.wordGraceMs, this.overlap.startedAt + this.tuning.minPauseMs) - Date.now();
+            if (this.resumeTimer) clearTimeout(this.resumeTimer);
+            this.resumeTimer = setTimeout(
+              () => {
+                this.resumeTimer = null;
+                if (this.playing === reply && reply.paused && this.pauseHandled && !this.finished) this.resumePlayback(reply);
+              },
+              Math.max(0, waitMs),
+            );
+          }
           if (this.overlapTimer) clearTimeout(this.overlapTimer);
           this.overlapTimer = setTimeout(() => {
             this.overlapTimer = null;
@@ -948,6 +991,7 @@ export class RealtimeAgent implements MediaTap {
     this.turnPieces = [];
     this.turnText = '';
     this.unansweredSince = 0;
+    this.holdOverruled = false;
   }
 
   // ---------- asking the model to speak ----------
@@ -1144,7 +1188,10 @@ export class RealtimeAgent implements MediaTap {
         this.turns[index]!.text = text;
         this.turns[index]!.annotation = annotation;
         const latest = this.turnPieces[this.turnPieces.length - 1];
-        if (latest && latest.itemId === String(event.item_id ?? '')) this.turnText = text;
+        if (latest && latest.itemId === String(event.item_id ?? '')) {
+          this.turnText = text;
+          if (this.endsInQuestion(text)) this.overruleHold();
+        }
         this.note(`transcript "${text}"`);
         this.opts.onCallerLine?.(`[${a.volume.class}, ${a.pace.class}${a.stutter.detected ? ', stuttering' : ''}] ${text}`);
         return;
@@ -1343,7 +1390,8 @@ export class RealtimeAgent implements MediaTap {
       this.hold();
       return;
     }
-    if (reply.speechEndAt) this.closeTurn();
+    // Whatever we are about to say, it answers what the caller has said so far.
+    this.closeTurn();
     this.opts.wordSpotter?.reset();
     this.overlap = null;
     this.agreedOverAgent = false;
@@ -1511,14 +1559,32 @@ export class RealtimeAgent implements MediaTap {
     this.holding = true;
     this.note('hold (caller mid-thought)');
     if (this.holdTimer) clearTimeout(this.holdTimer);
-    this.holdTimer = setTimeout(() => {
-      this.holdTimer = null;
-      if (!this.holding || this.finished) return;
-      this.holding = false;
-      this.note('hold expired');
-      this.addNote('[The caller has stopped talking. Respond now to what they said so far.]');
-      this.requestTurnReply();
-    }, this.tuning.holdMaxMs);
+    this.holdTimer = setTimeout(() => this.endHold('hold expired'), this.tuning.holdMaxMs);
+    // The model sometimes holds on a plainly finished question. If their words
+    // are already in and end in a question, they are waiting for an answer.
+    if (this.endsInQuestion(this.turnText)) this.overruleHold();
+  }
+
+  private endsInQuestion(text: string): boolean {
+    return /\?["')\]]?\s*$/.test(text.trim());
+  }
+
+  /** Their words end in a question: answer instead of holding (once per turn). */
+  private overruleHold(): void {
+    if (!this.holding || this.holdOverruled) return;
+    this.holdOverruled = true;
+    this.endHold('hold overruled (they asked a question)');
+  }
+
+  /** Stop holding and answer what the caller has said so far. */
+  private endHold(note: string): void {
+    if (this.holdTimer) clearTimeout(this.holdTimer);
+    this.holdTimer = null;
+    if (!this.holding || this.finished) return;
+    this.holding = false;
+    this.note(note);
+    this.addNote('[The caller has finished speaking and is waiting. Respond now to what they said.]');
+    this.requestTurnReply();
   }
 
   // ---------- playback ----------
@@ -1545,6 +1611,8 @@ export class RealtimeAgent implements MediaTap {
 
   private clearOverlap(): void {
     this.overlap = null;
+    if (this.resumeTimer) clearTimeout(this.resumeTimer);
+    this.resumeTimer = null;
     if (this.overlapTimer) clearTimeout(this.overlapTimer);
     if (this.classifyTimer) clearTimeout(this.classifyTimer);
     this.overlapTimer = null;

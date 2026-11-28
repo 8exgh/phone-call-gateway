@@ -179,6 +179,26 @@ export const SCENARIOS: Scenario[] = [
     ],
   },
   {
+    // One word over the agent, then silence: the agent must stop AND answer it.
+    name: 'interject',
+    probes: 'a single word over the agent ("Stop."): the agent stops and responds',
+    optIn: true,
+    success: [/214|two fourteen/i],
+    steps: [
+      turn,
+      { say: 'Can you tell me your hours, your address, and what the parking is like?', expect: 'reply' },
+      { waitAgentTalking: 1200, timeoutMs: 15000 },
+      { say: 'Stop.', expect: 'bargein', style: 'urgent' },
+      { waitAgentTurn: true, timeoutMs: 8000 },
+      { say: 'I just need the address.', expect: 'reply' },
+      turn,
+      { say: 'Thanks, bye.', expect: 'reply' },
+      { waitAgentTurn: true, timeoutMs: 8000 },
+      { pause: 1500 },
+      { hangup: true },
+    ],
+  },
+  {
     // The agent reaches a voicemail greeting and then silence. A natural agent
     // leaves one short message and hangs up; it must not talk to the empty line.
     name: 'voicemail',
