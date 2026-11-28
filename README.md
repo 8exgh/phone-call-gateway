@@ -128,6 +128,8 @@ Caller [volume: whisper, pace: normal]: okay... fine. that sounds reasonable.
   `gender` (female / male / neutral), `accent`, `age` and a few adjectives, with a
   `previewUrl` to listen to; filter with `?gender=female&accent=british&search=calm`.
   `GET /voices/:id/preview` returns a short spoken sample as it sounds on a phone line (WAV).
+  Provider previews exercise the real speech connection, rather than redirecting to a public
+  sample that may play even when the account cannot synthesize that voice.
   Use a voice by passing its `id` as `voice` on `POST /orchestrations` or
   `POST /inbound-config`, or make it the default for all of a client's calls with
   `POST /voice-config {voice}` (`GET` shows it, `DELETE` clears it). Order of precedence:
@@ -139,7 +141,16 @@ Caller [volume: whisper, pace: normal]: okay... fine. that sounds reasonable.
   speech model's own. With `ELEVENLABS_API_KEY` set, ElevenLabs voices are listed too, with
   ids of the form `elevenlabs:<voice_id>` and far more accents: the account's own voices
   always, and on a paid ElevenLabs plan the public voice library, searched live with the
-  same filters (`?accent=irish&gender=female`). ElevenLabs does not let free accounts use
+  same filters. Choosing a library voice adds it to the speech account first; the API key
+  needs **Voices → Write** (`voices_write`) as well as speech/read access. No plan is upgraded
+  and no existing voices are removed. Only standard-rate, unmoderated library voices are offered.
+  Provider defaults and inbound voice overrides are saved only after an actual speech probe succeeds.
+  Before dialing, the gateway checks provider speech again (including saved defaults); failure
+  returns HTTP **424** with the provider error and does **not** ring the recipient. Correct the
+  voice access or choose a working voice before retrying. Incoming calls are rejected before
+  connecting if their provider voice fails this check. Library lookup also verifies exact IDs;
+  a correctly shaped but nonexistent ID is no longer accepted as a real voice.
+  For example, search with `?accent=irish&gender=female`. ElevenLabs does not let free accounts use
   library voices over the API; the response's `notes` say so when that applies. For an
   ElevenLabs voice the model writes its reply as text and ElevenLabs speaks it as it is
   written; measured reply times are the same as for the built-in voices.

@@ -23,6 +23,7 @@ import type { RealtimeSocketFactory } from './realtime/realtimeSocket';
 import { renderLine } from './realtime/renderLine';
 import { VoiceCatalog, type VoiceSource } from './voices/catalog';
 import type { TtsStream, TtsStreamFactory } from './speech/ttsStream';
+import { renderTtsLine } from './speech/renderTtsLine';
 import type { WordSpotterFactory } from './realtime/wordSpotter';
 import { mulawToWav } from './audio/wav';
 import type { SpeechSynthesizer } from './speech/synthesizer';
@@ -1002,6 +1003,13 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     const from = await resolveFromFor(auth, parsed.data.from, reply);
     if (!from) return;
     if (!(await checkCallQuota(auth, reply))) return;
+    const spoken = await resolveVoice(parsed.data.voice, auth.kind === 'client' ? auth.client.id : undefined);
+    try {
+      spoken.voice = await preparePhoneVoice(spoken.voice);
+    } catch (error) {
+      return reply.code(424).send({ error: `voice unavailable: ${(error as Error).message}`, voice: spoken.voice });
+    }
+    // Voice preparation must succeed BEFORE Twilio rings the person.
     const started = await startCall(parsed.data.to, from);
     if (!started.ok) {
       return reply.code(424).send({ error: started.error, callId: started.callId });
@@ -1015,7 +1023,6 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
       from,
       goal: parsed.data.goal,
     });
-    const spoken = await resolveVoice(parsed.data.voice, record.clientId);
     runOrchestrator(record, {
       openingLine: parsed.data.openingLine,
       voice: spoken.voice,
@@ -1095,6 +1102,13 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid body' });
     }
+    if (parsed.data.voice) {
+      try {
+        parsed.data.voice = await preparePhoneVoice(parsed.data.voice);
+      } catch (error) {
+        return reply.code(424).send({ error: `voice unavailable: ${(error as Error).message}` });
+      }
+    }
     if (auth.kind === 'client') {
       store.update(auth.client.id, { inbound: parsed.data });
       return { inbound: parsed.data };
@@ -1145,6 +1159,15 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     if (!policy) return buildRejectTwiml();
     if (owner && (await overCallQuota(owner))) return buildRejectTwiml();
 
+    const spoken = await resolveVoice(policy.voice, owner?.id);
+    try {
+      spoken.voice = await preparePhoneVoice(spoken.voice);
+    } catch (error) {
+      // Do not accept the incoming call into a speech engine known to fail.
+      app.log.warn({ voice: spoken.voice, error: (error as Error).message }, 'inbound voice unavailable');
+      return buildRejectTwiml();
+    }
+
     const callId = randomUUID();
     const session = new CallSession(callId, {
       synthesizer: deps.synthesizer,
@@ -1177,7 +1200,7 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     });
     runOrchestrator(record, {
       openingLine: policy.openingLine,
-      voice: (await resolveVoice(policy.voice, owner?.id)).voice,
+      voice: spoken.voice,
     });
 
     return buildStreamTwiml(`${wsBase()}/twilio/media/${callId}`);
@@ -1191,6 +1214,17 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
   const previewCache = new Map<string, Buffer>();
 
   const serverDefaultVoice = (): string => defaultVoiceOverride ?? deps.realtime?.voice ?? config.ttsVoice;
+
+  /** Catalog samples alone do not establish permission to synthesize speech. */
+  const preparePhoneVoice = async (id: string): Promise<string> => {
+    if (!id.includes(':')) return id;
+    const provider = id.split(':')[0]!.toLowerCase();
+    const factory = deps.realtime?.ttsFactories?.[provider];
+    if (!factory) throw new Error(`${provider} speech engine is not configured`);
+    const voice = await voices.prepare(id);
+    await renderTtsLine(factory, voice.id.slice(voice.id.indexOf(':') + 1), 'Hello.');
+    return voice.id;
+  };
 
   /**
    * The voice a call will speak with. An explicit choice wins, then the
@@ -1241,8 +1275,20 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     if (!auth) return;
     const voice = await voices.find((req.params as { id: string }).id).catch(() => undefined);
     if (!voice) return reply.code(404).send({ error: 'unknown voice (GET /voices lists the choices)' });
-    // Provider voices come with the provider's own sample.
-    if (voice.provider !== 'openai' && /^https:\/\//.test(voice.previewUrl)) return reply.redirect(voice.previewUrl);
+    // Render through the same transport as calls: a public provider sample
+    // can play even when this account cannot use the voice for synthesis.
+    if (voice.provider !== 'openai') {
+      const factory = deps.realtime?.ttsFactories?.[voice.provider];
+      if (factory) {
+        try {
+          const prepared = await voices.prepare(voice.id);
+          const audio = await renderTtsLine(factory, prepared.id.slice(prepared.id.indexOf(':') + 1), VOICE_PREVIEW_LINE);
+          return reply.type('audio/wav').header('cache-control', 'no-store').send(mulawToWav(audio));
+        } catch (error) {
+          return reply.code(424).send({ error: `could not render preview: ${(error as Error).message}` });
+        }
+      }
+    }
     if (voice.provider !== 'openai' || !deps.realtime) {
       return reply.code(501).send({ error: 'previews are not available for this voice on this server' });
     }
@@ -1267,9 +1313,14 @@ export async function buildServer(deps: ServerDeps, config: ServerConfig): Promi
     if (!parsed.success) {
       return reply.code(400).send({ error: parsed.error.issues[0]?.message ?? 'invalid body' });
     }
-    const voice = await voices.find(parsed.data.voice).catch(() => undefined);
+    let voice = await voices.find(parsed.data.voice).catch(() => undefined);
     if (!voice) {
       return reply.code(400).send({ error: `unknown voice "${parsed.data.voice}" (GET /voices lists the choices)` });
+    }
+    try {
+      voice = { ...voice, id: await preparePhoneVoice(voice.id) };
+    } catch (error) {
+      return reply.code(424).send({ error: `voice unavailable: ${(error as Error).message}` });
     }
     if (auth.kind === 'client') store.update(auth.client.id, { voice: voice.id });
     else defaultVoiceOverride = voice.id;

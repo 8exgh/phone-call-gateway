@@ -4,6 +4,8 @@ import path from 'node:path';
 import { startGateway, type Gateway } from './helpers';
 import type { RealtimeSocket } from '../../src/realtime/realtimeSocket';
 import { encode as mulawEncode } from '../../src/audio/mulaw';
+import type { VoiceInfo, VoiceSource } from '../../src/voices/catalog';
+import type { TtsStreamFactory } from '../../src/speech/ttsStream';
 
 const ADMIN = 'admin-secret';
 
@@ -65,6 +67,61 @@ describe('voices', () => {
 
   afterEach(async () => {
     await gw.close();
+  });
+
+  it('prepares and tests a provider voice before saving or dialing, preserving preferences on failure', async () => {
+    const voice: VoiceInfo = { id: 'elevenlabs:sharedVoice1234567890', name: 'Paul', provider: 'elevenlabs', gender: 'male', accent: 'Australian', age: 'middle-aged', description: 'clear', previewUrl: 'https://example.com/public-sample.mp3' };
+    let permission = false;
+    let speechWorks = true;
+    let closed = 0;
+    const prepare = jest.fn(async () => {
+      if (!permission) throw new Error('ElevenLabs missing_permissions: missing voices_write');
+      return voice;
+    });
+    const source: VoiceSource = { provider: 'elevenlabs', list: async () => [voice], find: async (id) => id === voice.id ? voice : undefined, prepare, notes: () => [], accents: () => ['Australian'] };
+    const tts: TtsStreamFactory = () => ({
+      begin(audio, done, error) {
+        return { push() {}, cancel() {}, end() {
+          if (!speechWorks) { error?.('ElevenLabs voice_id_does_not_exist'); return; }
+          audio(mulawEncode(new Int16Array(160).fill(4000)));
+          done();
+        } };
+      },
+      close() { closed++; },
+    });
+    gw = await startGateway({
+      voiceSources: [source],
+      realtime: { socketFactory: speakingSocketFactory({ opened: 0 }), model: 'test', voice: 'marin', ttsFactories: { elevenlabs: tts } },
+    });
+    await call(gw, 'POST', '/numbers', { body: { areaCode: '415' } });
+    await call(gw, 'POST', '/inbound-config', { body: { goal: 'Keep my answering rules.', voice: 'cedar' } });
+    const configure = () => call(gw, 'POST', '/voice-config', { body: { voice: voice.id } });
+    const dial = (explicit = true) => call(gw, 'POST', '/orchestrations', { body: { to: '+15550001111', goal: 'Say hello.', ...(explicit ? { voice: voice.id } : {}) } });
+    expect((await configure()).status).toBe(424);
+    expect((await call(gw, 'GET', '/voice-config')).json.voice).toHaveProperty('id', 'marin');
+    expect((await dial()).json.error).toContain('missing voices_write');
+    expect(gw.twilioApi.mediaClients).toHaveLength(0);
+    expect((await call(gw, 'POST', '/inbound-config', { body: { goal: 'Replacement.', voice: voice.id } })).status).toBe(424);
+    expect((await call(gw, 'GET', '/inbound-config')).json.inbound).toEqual({ goal: 'Keep my answering rules.', voice: 'cedar' });
+    permission = true;
+    expect((await configure()).status).toBe(200);
+    expect(closed).toBe(1);
+    const preview = await call(gw, 'GET', `/voices/${voice.id}/preview`);
+    expect(preview.status).toBe(200);
+    expect(preview.bytes.subarray(0, 4).toString()).toBe('RIFF');
+    expect(preview.headers.get('location')).toBeNull();
+    speechWorks = false;
+    // Even a previously working persisted default must be rechecked before dialing.
+    expect((await dial(false)).json.error).toContain('voice_id_does_not_exist');
+    expect(gw.twilioApi.mediaClients).toHaveLength(0);
+    expect((await call(gw, 'GET', `/voices/${voice.id}/preview`)).status).toBe(424);
+    expect((await call(gw, 'GET', '/voice-config')).json.voice).toHaveProperty('id', voice.id);
+    // Removing the explicit inbound override inherits the unavailable default.
+    await call(gw, 'POST', '/inbound-config', { body: { goal: 'Answer with my default.' } });
+    const inbound = await call(gw, 'POST', '/twilio/voice', { body: { CallSid: 'CA-inbound-test', To: '+15550002222', From: '+15550003333' } });
+    expect(inbound.bytes.toString()).toContain('<Reject');
+    expect(inbound.bytes.toString()).not.toContain('<Stream');
+    expect(closed).toBe(5);
   });
 
   it('lists voices with gender and accent, and filters them', async () => {

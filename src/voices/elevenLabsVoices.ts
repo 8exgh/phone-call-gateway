@@ -1,6 +1,6 @@
 import type { VoiceFilter, VoiceInfo, VoiceSource } from './catalog';
 
-type Fetch = (url: string, init?: { headers?: Record<string, string> }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+type Fetch = (url: string, init?: { headers?: Record<string, string>; method?: string; body?: string; signal?: AbortSignal }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
 
 interface AccountVoice {
   voice_id: string;
@@ -13,6 +13,7 @@ interface AccountVoice {
 
 interface LibraryVoice {
   voice_id: string;
+  public_owner_id?: string;
   name: string;
   accent?: string;
   gender?: string;
@@ -64,6 +65,8 @@ export class ElevenLabsVoices implements VoiceSource {
   private planCheckedAt = 0;
   private readonly libraryCache = new Map<string, { at: number; voices: VoiceInfo[] }>();
   private lastError: string | null = null;
+  private readonly libraryDetails = new Map<string, LibraryVoice>();
+  private readonly preparing = new Map<string, Promise<VoiceInfo>>();
 
   constructor(
     private readonly apiKey: string,
@@ -71,12 +74,16 @@ export class ElevenLabsVoices implements VoiceSource {
     private readonly host = 'https://api.elevenlabs.io',
   ) {}
 
-  private async get(path: string): Promise<unknown> {
-    const res = await this.fetchFn(`${this.host}${path}`, { headers: { 'xi-api-key': this.apiKey } });
+  private async get(path: string, payload?: unknown): Promise<unknown> {
+    const res = await this.fetchFn(`${this.host}${path}`, {
+      headers: { 'xi-api-key': this.apiKey, ...(payload ? { 'content-type': 'application/json' } : {}) },
+      ...(payload ? { method: 'POST', body: JSON.stringify(payload) } : {}),
+      signal: AbortSignal.timeout(5000),
+    });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) {
-      const detail = (body as { detail?: { message?: string } }).detail;
-      throw new Error(detail?.message ?? `ElevenLabs HTTP ${res.status}`);
+      const detail = (body as { detail?: { message?: string; status?: string } }).detail;
+      throw new Error(`ElevenLabs ${detail?.status ?? `HTTP ${res.status}`}: ${detail?.message ?? 'request failed'}`.replaceAll(this.apiKey, '[redacted]').slice(0, 500));
     }
     return body;
   }
@@ -143,6 +150,7 @@ export class ElevenLabsVoices implements VoiceSource {
       // Live-moderated voices answer slower; custom-rate voices cost more per character.
       .filter((v) => !v.live_moderation_enabled && (v.rate ?? 1) <= 1)
       .map((v): VoiceInfo => {
+        this.libraryDetails.set(`elevenlabs:${v.voice_id}`, v);
         const { name, description } = splitName(v.name, [v.descriptive, v.use_case]);
         return {
           id: `elevenlabs:${v.voice_id}`,
@@ -155,7 +163,12 @@ export class ElevenLabsVoices implements VoiceSource {
           previewUrl: v.preview_url ?? '',
         };
       });
-    if (this.libraryCache.size > 200) this.libraryCache.clear();
+    if (this.libraryCache.size > 200) {
+      this.libraryCache.clear();
+      // Keep details for this latest result, which may be selected next.
+      const keep = new Set(voices.map((v) => v.id));
+      for (const id of this.libraryDetails.keys()) if (!keep.has(id)) this.libraryDetails.delete(id);
+    }
     this.libraryCache.set(key, { at: Date.now(), voices });
     return voices;
   }
@@ -176,14 +189,45 @@ export class ElevenLabsVoices implements VoiceSource {
   }
 
   async find(id: string): Promise<VoiceInfo | undefined> {
-    const own = await this.list({});
-    const known = own.find((v) => v.id === id) ?? [...this.libraryCache.values()].flatMap((c) => c.voices).find((v) => v.id === id);
+    if (!/^elevenlabs:[A-Za-z0-9]{10,40}$/.test(id)) return undefined;
+    const own = (await this.accountVoices()).find((v) => v.id === id);
+    if (own && !this.account!.fromLibrary.has(id)) return own;
+    if (!(await this.canUseLibrary())) return undefined;
+    const known = own ?? [...this.libraryCache.values()].filter((c) => Date.now() - c.at < LIBRARY_TTL_MS).flatMap((c) => c.voices).find((v) => v.id === id);
     if (known) return known;
-    // An id we have not listed: usable only where the library is.
-    if ((await this.canUseLibrary()) && /^elevenlabs:[A-Za-z0-9]{10,40}$/.test(id)) {
-      return { id, name: id.slice(11), provider: 'elevenlabs', gender: 'neutral', accent: 'Unspecified', age: 'middle-aged', description: 'voice library', previewUrl: '' };
+    // Resolve the exact ID after a restart, even if it is outside the first
+    // page of results. A well-formed ID alone is not proof the voice exists.
+    return (await this.libraryVoices({ search: id.slice(11) })).find((v) => v.id === id);
+  }
+
+  async prepare(id: string): Promise<VoiceInfo> {
+    const pending = this.preparing.get(id);
+    if (pending) return pending;
+    const work = this.prepareVoice(id);
+    this.preparing.set(id, work);
+    try {
+      return await work;
+    } finally {
+      this.preparing.delete(id);
     }
-    return undefined;
+  }
+
+  private async prepareVoice(id: string): Promise<VoiceInfo> {
+    const voice = await this.find(id);
+    if (!voice) throw new Error(`unknown ElevenLabs voice "${id}"`);
+    if (this.account?.voices.some((v) => v.id === id)) return voice;
+    const shared = this.libraryDetails.get(id);
+    if (!shared?.public_owner_id) throw new Error('ElevenLabs library voice has no public owner; choose another voice');
+    // Library search/preview access does not grant synthesis access. Add only
+    // the selected, standard-rate voice; never change the plan or delete voices.
+    const added = (await this.get(`/v1/voices/add/${encodeURIComponent(shared.public_owner_id)}/${encodeURIComponent(shared.voice_id)}`, {
+      new_name: shared.name,
+      bookmarked: false,
+    })) as { voice_id?: string };
+    if (!added.voice_id || !/^[A-Za-z0-9]{10,40}$/.test(added.voice_id)) throw new Error('ElevenLabs did not return an added voice ID');
+    const prepared = { ...voice, id: `elevenlabs:${added.voice_id}` };
+    this.account = null; // the account listing is now stale
+    return prepared;
   }
 
   /** Accents the public library can be searched for (it is far larger than any one listing). */
