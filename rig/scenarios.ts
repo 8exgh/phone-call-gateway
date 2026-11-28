@@ -199,6 +199,25 @@ export const SCENARIOS: Scenario[] = [
     ],
   },
   {
+    // "Stop." and the real request in one breath: the agent must answer the request,
+    // not just hand the floor back.
+    name: 'interject-ask',
+    probes: '"Stop. I just need the address." over the agent: it stops and gives the address',
+    optIn: true,
+    success: [/214|two fourteen/i],
+    steps: [
+      turn,
+      { say: 'Can you tell me your hours, your address, and what the parking is like?', expect: 'reply' },
+      { waitAgentTalking: 1200, timeoutMs: 15000 },
+      { say: 'Stop. I just need the address.', expect: 'bargein', style: 'hesitant' },
+      turn,
+      { say: 'Thanks, bye.', expect: 'reply' },
+      { waitAgentTurn: true, timeoutMs: 8000 },
+      { pause: 1500 },
+      { hangup: true },
+    ],
+  },
+  {
     // The agent reaches a voicemail greeting and then silence. A natural agent
     // leaves one short message and hangs up; it must not talk to the empty line.
     name: 'voicemail',
