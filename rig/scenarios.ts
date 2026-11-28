@@ -44,6 +44,8 @@ export interface Scenario {
   style?: 'natural' | 'hesitant' | 'urgent';
   /** Background noise mixed into the caller's side for the whole call (RMS, speech is ~2500). */
   noiseRms?: number;
+  /** Left out of a normal run; ask for it by name (--scenario voicemail). */
+  optIn?: boolean;
   /** Agent-turn text must match each of these for the task to count as done. */
   success?: RegExp[];
   steps: Step[];
@@ -173,6 +175,19 @@ export const SCENARIOS: Scenario[] = [
       { say: 'Okay, thanks. Bye.', expect: 'reply' },
       { waitAgentTurn: true, timeoutMs: 8000 },
       { pause: 1500 },
+      { hangup: true },
+    ],
+  },
+  {
+    // The agent reaches a voicemail greeting and then silence. A natural agent
+    // leaves one short message and hangs up; it must not talk to the empty line.
+    name: 'voicemail',
+    probes: 'voicemail greeting then silence: one short message, then hang up',
+    optIn: true,
+    steps: [
+      turn,
+      { say: 'The person you are trying to reach is not available. At the tone, please record your message.', expect: 'reply' },
+      { pause: 90_000 },
       { hangup: true },
     ],
   },
